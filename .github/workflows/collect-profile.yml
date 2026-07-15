@@ -1,0 +1,86 @@
+# Ravn-published reusable workflow.
+#
+# WHY A REUSABLE WORKFLOW (not a composite action):
+# When a caller invokes this via `uses: ravnsecurity/ravn-actions/.github/workflows/collect-profile.yml@<sha>`,
+# the OIDC token minted for the job carries a `job_workflow_ref` claim pointing at THIS file
+# at THIS exact SHA. That claim is embedded in the signed SLSA provenance produced by
+# attest-build-provenance. Composite actions do NOT appear in OIDC claims — a user could
+# swap the action body and the provenance would look identical. With a reusable workflow,
+# Ravn can verify server-side that the digest was produced by an approved workflow version,
+# regardless of what else the caller's workflow does before/after.
+name: Ravn Profile Collection
+
+on:
+  workflow_call:
+    inputs:
+      config-path:
+        description: Path to ravn.config.yml in the caller's repo
+        type: string
+        default: ravn.config.yml
+    secrets:
+      RAVN_READONLY_TOKEN:
+        description: >
+          Fine-grained PAT with read-only scopes (contents: none needed; just
+          "Read access to metadata" + account-level read). Used to see the
+          user's full activity picture. Only aggregates ever leave the runner.
+        required: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write        # OIDC token for Sigstore signing
+      attestations: write    # write to the attestations API
+    steps:
+      # Caller's repo: only needed to read their ravn.config.yml
+      - name: Checkout caller config
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            ${{ inputs.config-path }}
+          sparse-checkout-cone-mode: false
+
+      # Ravn's collection script, pinned. NOTE: in production pin this ref to a
+      # full commit SHA and keep a public changelog of approved SHAs.
+      - name: Checkout ravn-actions (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: ravnsecurity/ravn-actions
+          ref: main   # <-- replace with full SHA in production
+          path: .ravn-actions
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Collect + digest
+        id: collect
+        env:
+          # Prefer the read-only PAT (full account visibility). Fall back to
+          # GITHUB_TOKEN, which only sees this repo — still useful for a
+          # public-only digest.
+          RAVN_TOKEN: ${{ secrets.RAVN_READONLY_TOKEN || github.token }}
+          RAVN_CONFIG_PATH: ${{ inputs.config-path }}
+          RAVN_ACTOR: ${{ github.actor }}
+        run: |
+          node .ravn-actions/scripts/collect.mjs
+          echo "digest-path=profile-digest.json" >> "$GITHUB_OUTPUT"
+
+      # Signed SLSA provenance for the digest. The predicate records the
+      # runner environment, the caller repo/ref, and job_workflow_ref (this
+      # file @ SHA). Verifiable later with `gh attestation verify`.
+      - name: Attest digest
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: profile-digest.json
+
+      - name: Upload digest artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ravn-profile-digest
+          path: |
+            profile-digest.json
+            profile-summary.md
+          retention-days: 30
