@@ -1,7 +1,7 @@
 # Ravn-published reusable workflow.
 #
 # WHY A REUSABLE WORKFLOW (not a composite action):
-# When a caller invokes this via `uses: ravnsecurity/ravn-actions/.github/workflows/collect-profile.yml@<sha>`,
+# When a caller invokes this via `uses: RavnSecurity/ravn-actions/.github/workflows/collect-profile.yml@<sha>`,
 # the OIDC token minted for the job carries a `job_workflow_ref` claim pointing at THIS file
 # at THIS exact SHA. That claim is embedded in the signed SLSA provenance produced by
 # attest-build-provenance. Composite actions do NOT appear in OIDC claims — a user could
@@ -46,7 +46,7 @@ jobs:
       - name: Checkout ravn-actions (pinned)
         uses: actions/checkout@v4
         with:
-          repository: ravnsecurity/ravn-actions
+          repository: RavnSecurity/ravn-actions
           ref: main   # <-- replace with full SHA in production
           path: .ravn-actions
 
