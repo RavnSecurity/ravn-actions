@@ -5,3 +5,5 @@
 # '# <sha> <date> <why>' comment line); existing entries are never rewritten.
 # A revocation lane for compromised SHAs is TBD — RavnSecurity/ravn-platform#137.
 4dce0f29bfb8a02f3a10eb1b9045df9de0bbc29c
+# 23eca48b197c67ccb98fc259f8d7953ebf497fa5 2026-08-09 script-pin + bundle tooling (ravn-platform#137 WS-B1)
+23eca48b197c67ccb98fc259f8d7953ebf497fa5
