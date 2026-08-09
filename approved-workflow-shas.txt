@@ -1,1 +1,7 @@
+# Ravn approved collector-workflow SHAs — one full 40-hex commit SHA of
+# RavnSecurity/ravn-actions per line. Lines starting with '#' are comments;
+# consumers must strip '#'-to-end-of-line and whitespace before matching.
+# APPEND-ONLY: newly approved SHAs are appended (annotated with a
+# '# <sha> <date> <why>' comment line); existing entries are never rewritten.
+# A revocation lane for compromised SHAs is TBD — RavnSecurity/ravn-platform#137.
 4dce0f29bfb8a02f3a10eb1b9045df9de0bbc29c

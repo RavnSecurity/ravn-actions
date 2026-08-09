@@ -41,13 +41,17 @@ jobs:
             ${{ inputs.config-path }}
           sparse-checkout-cone-mode: false
 
-      # Ravn's collection script, pinned. NOTE: in production pin this ref to a
-      # full commit SHA and keep a public changelog of approved SHAs.
+      # Ravn's collection script, pinned to the SAME commit as this workflow file.
+      # The attested claim (job_workflow_ref + job_workflow_sha in the signing cert)
+      # covers only THIS FILE's SHA — checking out a branch here would let the script
+      # drift from the attested workflow version, so code and claim could diverge
+      # (the script-pin gap, RavnSecurity/ravn-platform#133). Riding
+      # github.job_workflow_sha extends the verified claim to the collector code.
       - name: Checkout ravn-actions (pinned)
         uses: actions/checkout@v4
         with:
           repository: RavnSecurity/ravn-actions
-          ref: main   # <-- replace with full SHA in production
+          ref: ${{ github.job_workflow_sha }}
           path: .ravn-actions
 
       - name: Setup Node
