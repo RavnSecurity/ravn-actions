@@ -3,13 +3,14 @@
 #
 # Creates your own copy of Ravn's profile-template repo, optionally wires
 # up a read-only PAT for full visibility, runs the collector workflow, and
-# hands you back a signed, verifiable profile digest — all from your
+# hands you back a signed, verifiable profile digest PLUS the submission
+# bundle (ravn-profile-bundle.json) the Ravn portal accepts — all from your
 # terminal, with no state left anywhere except the repo it creates for you.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/RavnSecurity/ravn-actions/main/scripts/get-ravn-profile.sh | bash
 #
-# Requires: gh (authenticated via `gh auth login`), git.
+# Requires: gh (authenticated via `gh auth login`), git, jq.
 set -euo pipefail
 
 TEMPLATE_SOURCE="RavnSecurity/ravn-profile-template"
@@ -24,7 +25,7 @@ else
   BOLD=""; RED=""; GREEN=""; YELLOW=""; CYAN=""; RESET=""
 fi
 
-TOTAL_STEPS=9
+TOTAL_STEPS=10
 STEP_NUM=0
 step()  { STEP_NUM=$((STEP_NUM + 1)); printf '\n%s[%d/%d] %s%s\n' "${BOLD}${CYAN}" "$STEP_NUM" "$TOTAL_STEPS" "$1" "$RESET"; }
 info()  { printf '    %s\n' "$1"; }
@@ -45,6 +46,10 @@ ask() { # ask "question" default -> echoes the answer
   read -r -p "    $1 [$2]: " reply
   echo "${reply:-$2}"
 }
+
+# sha256 across coreutils (sha256sum) and macOS (shasum) flavors.
+sha256_file()  { { command -v sha256sum >/dev/null 2>&1 && sha256sum "$1" || shasum -a 256 "$1"; } | awk '{print $1}'; }
+sha256_stdin() { { command -v sha256sum >/dev/null 2>&1 && sha256sum      || shasum -a 256;      } | awk '{print $1}'; }
 
 trap 'err "Something went wrong. Re-running this script is safe — it picks up where it left off."' ERR
 
@@ -69,6 +74,8 @@ command -v git >/dev/null 2>&1 || { err "git is required. Install it and re-run.
 ok "git found"
 command -v gh  >/dev/null 2>&1 || { err "GitHub CLI (gh) is required: https://cli.github.com"; exit 1; }
 ok "gh found"
+command -v jq  >/dev/null 2>&1 || { err "jq is required (bundle assembly): https://jqlang.org"; exit 1; }
+ok "jq found"
 
 if ! gh auth status >/dev/null 2>&1; then
   warn "You're not logged into gh yet."
@@ -221,10 +228,66 @@ else
   warn "Signature check failed — don't submit this digest as-is."
 fi
 
-# ---------- 9. done ----------
+# ---------- 9. assemble the submission bundle ----------
+step "Assembling your submission bundle"
+DIGEST_FILE="$OUTDIR/profile-digest.json"
+BUNDLE_FILE="$OUTDIR/ravn-profile-bundle.json"
+DIGEST_SHA=$(sha256_file "$DIGEST_FILE")
+
+# The Sigstore bundle GitHub stored for the digest. gh's native command first
+# (gh >= 2.49 writes a sha256:<hex>.jsonl, one bundle per line, newest first);
+# older gh builds get the same bundle object from the attestations REST API.
+fetch_attestation() {
+  local dir file
+  dir=$(mktemp -d)
+  if (cd "$dir" && gh attestation download "$DIGEST_FILE" --repo "$REPO" >/dev/null 2>&1); then
+    file=$(find "$dir" -name '*.jsonl' 2>/dev/null | head -n 1)
+    if [ -n "$file" ] && [ -s "$file" ]; then
+      head -n 1 "$file" | jq 'if type == "object" and has("bundle") then .bundle else . end'
+      rm -rf "$dir"
+      return 0
+    fi
+  fi
+  rm -rf "$dir"
+  gh api "repos/$REPO/attestations/sha256:$DIGEST_SHA" --jq '.attestations[0].bundle'
+}
+
+ATTESTATION=$(fetch_attestation)
+if [ -z "$ATTESTATION" ] || [ "$ATTESTATION" = "null" ]; then
+  err "Couldn't fetch the attestation for your digest, so no bundle was assembled."
+  err "  Retry in a minute, or check https://github.com/$REPO/attestations"
+  exit 1
+fi
+
+# ravn.profile-bundle/v0: the digest rides as the EXACT file bytes in a JSON
+# string (--rawfile) so any verifier hashes precisely what was attested before
+# parsing it; the attestation is the Sigstore bundle object as-is.
+jq -n --rawfile digest "$DIGEST_FILE" --argjson attestation "$ATTESTATION" \
+  '{schema: "ravn.profile-bundle/v0", digest: $digest, attestation: $attestation}' \
+  > "$BUNDLE_FILE"
+
+# Self-check the binding Ravn re-verifies server-side: the embedded string must
+# round-trip to bytes whose sha256 equals the signed in-toto subject digest.
+EMBEDDED_SHA=$(jq -j '.digest' "$BUNDLE_FILE" | sha256_stdin)
+SUBJECT_SHA=$(jq -r \
+  '.attestation.dsseEnvelope.payload | @base64d | fromjson | .subject[0].digest.sha256 // empty' \
+  "$BUNDLE_FILE")
+if [ -n "$SUBJECT_SHA" ] && [ "$EMBEDDED_SHA" = "$SUBJECT_SHA" ]; then
+  ok "Bundle written — sha256(digest) matches the attestation subject."
+else
+  warn "Bundle self-check FAILED (subject: ${SUBJECT_SHA:-none}, digest: $EMBEDDED_SHA)."
+  warn "Don't submit this bundle — re-run the script, or file an issue on ravn-actions."
+fi
+
+# ---------- 10. done ----------
 step "Done"
-info "Digest:  $OUTDIR/profile-digest.json"
+info "Digest:  $DIGEST_FILE"
 info "Summary: $OUTDIR/profile-summary.md"
-info "Hand profile-digest.json to your Ravn contact along with the repo"
-info "it came from ($REPO) — they'll re-verify it against Ravn's approved"
-info "workflow list before trusting it as triager context."
+info "Bundle:  $BUNDLE_FILE"
+echo
+info "Upload ${BOLD}ravn-profile-bundle.json${RESET} in the Ravn portal:"
+info "  ${BOLD}https://apps.ravnsecurity.io/app/profile${RESET}"
+info "Ravn re-verifies the signature and the workflow version against its"
+info "approved list (RavnSecurity/ravn-actions/approved-workflow-shas.txt)"
+info "before the profile is shown to triagers. No portal access yet? Hand"
+info "the bundle to your Ravn contact instead."
