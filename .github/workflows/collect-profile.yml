@@ -76,9 +76,34 @@ jobs:
       # runner environment, the caller repo/ref, and job_workflow_ref (this
       # file @ SHA). Verifiable later with `gh attestation verify`.
       - name: Attest digest
+        id: attest
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: profile-digest.json
+
+      # Staple the digest to the Sigstore bundle the attest step just minted
+      # (bundle-path is the LOCAL copy of what it persisted to the API), so the
+      # artifact carries the upload-ready ravn.profile-bundle/v0 the portal
+      # accepts — no client-side assembly, no attestations-API round trip, no
+      # gh required. --rawfile embeds the digest's EXACT bytes: any verifier
+      # hashes precisely what was attested before parsing.
+      - name: Assemble submission bundle
+        env:
+          BUNDLE_PATH: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          jq -n --rawfile digest profile-digest.json --slurpfile att "$BUNDLE_PATH" \
+            '{schema: "ravn.profile-bundle/v0", digest: $digest, attestation: $att[0]}' \
+            > ravn-profile-bundle.json
+          # Enforced, not printed: a mismatch means the bundle embeds bytes
+          # other than what was attested — shipping it green would surface as
+          # a portal rejection much later. Fail HERE.
+          embedded=$(jq -j '.digest' ravn-profile-bundle.json | sha256sum | cut -d' ' -f1)
+          actual=$(sha256sum profile-digest.json | cut -d' ' -f1)
+          if [ "$embedded" != "$actual" ]; then
+            echo "::error::bundle self-check failed: embedded digest $embedded != attested file $actual"
+            exit 1
+          fi
+          echo "Bundle self-check OK ($actual)"
 
       - name: Upload digest artifact
         uses: actions/upload-artifact@v4
@@ -87,4 +112,5 @@ jobs:
           path: |
             profile-digest.json
             profile-summary.md
+            ravn-profile-bundle.json
           retention-days: 30

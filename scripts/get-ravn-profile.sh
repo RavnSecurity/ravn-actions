@@ -120,7 +120,53 @@ else
 fi
 cd "$REPO_NAME"
 WORKDIR="$(pwd)"
+if [ "$REUSE" = 1 ] && ! git pull -q --ff-only 2>/dev/null; then
+  warn "Couldn't fast-forward your clone (diverged/offline?) — using it as-is."
+fi
 ok "Ready at $WORKDIR"
+
+# An existing copy may be pinned to an older collector. The pin is what ends up
+# in the signed provenance, so newer = the hardened workflow + the in-run
+# bundle assembly. Old pins still verify (the approved list is append-only) —
+# this is an upgrade offer, not a requirement.
+if [ "$REUSE" = 1 ]; then
+  WF_FILE=".github/workflows/generate-ravn-profile.yml"
+  # Raw media type: no base64 decode (BSD/GNU flag mess) and no newline question.
+  LATEST_PIN=$(gh api -H "Accept: application/vnd.github.raw" \
+      "repos/$TEMPLATE_SOURCE/contents/$WF_FILE" 2>/dev/null \
+    | grep -oE 'collect-profile\.yml@[0-9a-f]{40}' | head -n1 | cut -d@ -f2 || true)
+  LOCAL_PIN=$(grep -oE 'collect-profile\.yml@[0-9a-f]{40}' "$WF_FILE" | head -n1 | cut -d@ -f2 || true)
+  if [ -n "$LATEST_PIN" ] && [ -n "$LOCAL_PIN" ] && [ "$LATEST_PIN" != "$LOCAL_PIN" ]; then
+    warn "Your copy pins collector ${LOCAL_PIN:0:7}; the template now pins ${LATEST_PIN:0:7}."
+    if confirm "Update your copy to the latest collector?" Y; then
+      tmp=$(mktemp)
+      sed "s/collect-profile\.yml@${LOCAL_PIN}/collect-profile.yml@${LATEST_PIN}/" "$WF_FILE" > "$tmp" \
+        && mv "$tmp" "$WF_FILE"
+      # ❗Pathspec commit, never -a: a reused clone may carry the user's own
+      # uncommitted work, which is not ours to publish — or to destroy when
+      # unwinding below. Guarded: a machine with no git identity fails here,
+      # not the whole onboarding.
+      if git commit -q -m "Update collector pin to ${LATEST_PIN:0:7} (latest approved)" -- "$WF_FILE" \
+        && git push -q; then
+        # gh's own OAuth token carries the workflow scope, so the push
+        # normally succeeds; a bare PAT without it lands in the else.
+        ok "Pinned to ${LATEST_PIN:0:7} and pushed."
+      else
+        # Unwind ONLY our change, whichever step refused: drop the pin commit
+        # if it was made, restore just the workflow file, touch nothing else.
+        git log -1 --format=%s 2>/dev/null | grep -q '^Update collector pin' && git reset -q HEAD~1
+        git checkout -q HEAD -- "$WF_FILE" 2>/dev/null || true
+        warn "Couldn't push the pin update (missing git identity, or a git"
+        warn "credential without the 'workflow' scope). Your files are untouched —"
+        warn "update the pin by editing $WF_FILE in the GitHub web UI instead."
+      fi
+    fi
+  elif [ -n "$LATEST_PIN" ] && [ -n "$LOCAL_PIN" ]; then
+    ok "Collector pin is current in your clone (${LOCAL_PIN:0:7})."
+  else
+    warn "Couldn't check the template's latest pin (offline?) — continuing with yours."
+  fi
+fi
 
 # ---------- 4. optional PAT ----------
 step "Optional: read-only PAT for full visibility"
@@ -213,8 +259,14 @@ fi
 
 # ---------- 7. download the digest ----------
 step "Downloading your digest"
-OUTDIR="$WORKDIR/ravn-profile-digest"
-rm -rf "$OUTDIR"
+# ~/Downloads when it exists (where people look for downloaded things), else
+# next to the clone. A dated subdir so re-runs never clobber an old profile.
+if [ -d "$HOME/Downloads" ]; then
+  OUTDIR="$HOME/Downloads/ravn-profile-$(date +%Y%m%d-%H%M%S)"
+else
+  OUTDIR="$WORKDIR/ravn-profile-digest"
+  rm -rf "$OUTDIR"
+fi
 gh run download "$RUN_ID" --repo "$REPO" -n ravn-profile-digest -D "$OUTDIR"
 ok "Saved to $OUTDIR"
 echo
@@ -233,6 +285,14 @@ step "Assembling your submission bundle"
 DIGEST_FILE="$OUTDIR/profile-digest.json"
 BUNDLE_FILE="$OUTDIR/ravn-profile-bundle.json"
 DIGEST_SHA=$(sha256_file "$DIGEST_FILE")
+
+# Collectors since the in-run assembly step ship the bundle IN the artifact —
+# nothing to fetch or staple. The client-side path below stays as the fallback
+# for copies still pinned to an older collector.
+if [ -s "$BUNDLE_FILE" ]; then
+  ok "The workflow already assembled the bundle (in-run) — verifying it."
+fi
+if [ ! -s "$BUNDLE_FILE" ]; then
 
 # The Sigstore bundle GitHub stored for the digest. gh's native command first
 # (gh >= 2.49 writes a sha256:<hex>.jsonl, one bundle per line, newest first);
@@ -266,6 +326,8 @@ jq -n --rawfile digest "$DIGEST_FILE" --argjson attestation "$ATTESTATION" \
   '{schema: "ravn.profile-bundle/v0", digest: $digest, attestation: $attestation}' \
   > "$BUNDLE_FILE"
 
+fi # ! -s BUNDLE_FILE — the fallback client-side assembly
+
 # Self-check the binding Ravn re-verifies server-side: the embedded string must
 # round-trip to bytes whose sha256 equals the signed in-toto subject digest.
 EMBEDDED_SHA=$(jq -j '.digest' "$BUNDLE_FILE" | sha256_stdin)
@@ -285,8 +347,10 @@ info "Digest:  $DIGEST_FILE"
 info "Summary: $OUTDIR/profile-summary.md"
 info "Bundle:  $BUNDLE_FILE"
 echo
-info "Upload ${BOLD}ravn-profile-bundle.json${RESET} in the Ravn portal:"
-info "  ${BOLD}https://apps.ravnsecurity.io/app/profile${RESET}"
+info "Next: open ${BOLD}https://apps.ravnsecurity.io/app/profile${RESET},"
+info "sign in, click ${BOLD}Enroll${RESET} (first visit only), then upload"
+info "${BOLD}$BUNDLE_FILE${RESET}"
+info "(it's in your Downloads folder when one exists)."
 info "Ravn re-verifies the signature and the workflow version against its"
 info "approved list (RavnSecurity/ravn-actions/approved-workflow-shas.txt)"
 info "before the profile is shown to triagers. No portal access yet? Hand"
