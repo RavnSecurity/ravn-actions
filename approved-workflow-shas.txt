@@ -7,3 +7,5 @@
 4dce0f29bfb8a02f3a10eb1b9045df9de0bbc29c
 # 23eca48b197c67ccb98fc259f8d7953ebf497fa5 2026-08-09 script-pin + bundle tooling (ravn-platform#137 WS-B1)
 23eca48b197c67ccb98fc259f8d7953ebf497fa5
+# e6d0c5acbc9f7e5aacb907aa073b41aae70c3c18 2026-08-10 in-run bundle assembly + create-or-update onboarding (ravn-platform#154 stage-0.5)
+e6d0c5acbc9f7e5aacb907aa073b41aae70c3c18
