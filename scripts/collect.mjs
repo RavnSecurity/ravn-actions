@@ -2,16 +2,38 @@
 /**
  * Ravn profile collector.
  *
- * Runs INSIDE the user's Actions environment. It may see the user's full
- * picture (via a read-only PAT), but only aggregate/digested signals are
- * written to profile-digest.json. Raw repo names for private repos, commit
- * messages, issue bodies, etc. never leave the runner.
+ * Runs INSIDE the reporter's own Actions environment. It may see their full
+ * picture (via a read-only PAT they mint), but only aggregate/digested
+ * observations are written to profile-digest.json. Private repo names, commit
+ * messages and issue bodies never leave the runner.
  *
- * Redaction is config-driven (ravn.config.yml) so the user decides how much
- * signal to share. Defaults are conservative.
+ * ── What changed at digest v1, and why it matters ──────────────────────────
+ *
+ * v0 emitted `signals` — a bag of aggregates about the reporter's OWN account:
+ * how many repos, which languages, how many followers. All true, all weak, and
+ * all self-selected.
+ *
+ * v1 adds `observations`: individually-typed facts, the most important of which
+ * is CONTRIBUTION TO NOTABLE UPSTREAM PROJECTS. That one is different in kind
+ * from everything else here, because merged pull requests into public
+ * repositories are PUBLIC — Ravn can go and confirm them without trusting this
+ * digest at all. The attestation is not what makes those claims true; it is what
+ * makes them worth an API call.
+ *
+ * ❗The collector states what it SAW. It assigns no scores and draws no
+ * conclusions. What an observation is WORTH is a versioned model on Ravn's side,
+ * so that changing our mind never costs a reporter a re-run. Anything in this
+ * file that starts to look like a weighting belongs over there instead.
+ *
+ * ❗Notability is decided by notability/notable-projects.txt, which ships at this
+ * same commit and is therefore covered by the same attestation. The reporter may
+ * nominate additional repositories, and those are marked as their assertion —
+ * never as a notable-project claim.
  */
 
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { resolveConfig } from "./lib/config.mjs";
+import { isNotable, loadNotabilitySet } from "./lib/notability.mjs";
 
 const TOKEN = process.env.RAVN_TOKEN;
 const ACTOR = process.env.RAVN_ACTOR;
@@ -22,27 +44,8 @@ if (!TOKEN) {
   process.exit(1);
 }
 
-// ---------- config (tiny YAML subset parser: `key: value` lines) ----------
-const DEFAULTS = {
-  share_account_age: true,
-  share_contribution_totals: true,        // yearly totals, no per-repo detail
-  share_private_repo_count: false,        // count only, never names
-  share_public_repo_names: false,         // top public repos by recent activity
-  share_language_breakdown: true,         // aggregate across visible repos
-  share_org_memberships: false,           // public org logins only
-  share_security_signal: true,            // advisories/CVE-adjacent public repos touched
-};
-
-function loadConfig() {
-  const cfg = { ...DEFAULTS };
-  if (existsSync(CONFIG_PATH)) {
-    for (const line of readFileSync(CONFIG_PATH, "utf8").split("\n")) {
-      const m = line.match(/^\s*([a-z_]+)\s*:\s*(true|false)\s*(#.*)?$/);
-      if (m && m[1] in cfg) cfg[m[1]] = m[2] === "true";
-    }
-  }
-  return cfg;
-}
+const configText = existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "";
+const { cfg, unknown } = resolveConfig(configText);
 
 // ---------- GitHub API helpers ----------
 const API = "https://api.github.com";
@@ -71,36 +74,58 @@ async function graphql(query, variables = {}) {
 
 // ---------- collection ----------
 async function main() {
-  const cfg = loadConfig();
   const user = await rest("/user").catch(() => rest(`/users/${ACTOR}`));
   const login = user.login;
+  const notability = loadNotabilitySet();
+  const warnings = [];
+  if (unknown.length) warnings.push(`unknown config keys ignored: ${unknown.join(", ")}`);
+  if (notability.missing) warnings.push("notability list not found; upstream matching skipped");
 
   const digest = {
-    schema: "ravn.profile-digest/v0",
-    generated_at: new Date().toISOString(),
+    schema: "ravn.profile-digest/v1",
     subject: {
+      source: "github",
       github_login: login,
-      github_id: user.id, // stable even across renames
+      github_id: user.id,
+      // ❗The STABLE id, named the way Ravn's verifier reads it. A login is
+      // renameable and recyclable; binding evidence to one binds it to a
+      // spelling somebody else can later hold.
+      external_id: user.id,
     },
+    generated_at: new Date().toISOString(),
+    // The sharing config travels INSIDE the signed digest, so a triager sees
+    // what was withheld. What was withheld is itself signal.
     redaction: cfg,
+    notability: { set: notability.id, sha256: notability.sha256 },
+    observations: [],
+    assertions: [],
+    // v0's shape, still emitted so anything reading the old format keeps working.
     signals: {},
+    warnings,
   };
 
+  const observe = (type, subject, payload) =>
+    digest.observations.push({ type, subject: String(subject ?? ""), payload });
+
+  // ── account standing
   if (cfg.share_account_age) {
-    digest.signals.account = {
+    const account = {
       created_at: user.created_at,
-      account_age_days: Math.floor(
-        (Date.now() - new Date(user.created_at)) / 86400000
-      ),
+      account_age_days: Math.floor((Date.now() - new Date(user.created_at).getTime()) / 86_400_000),
       followers: user.followers,
+      public_repos: user.public_repos,
     };
+    digest.signals.account = account;
+    observe("github.account", "", account);
   }
 
-  // Contribution totals per year via GraphQL contributionsCollection.
+  const thisYear = new Date().getUTCFullYear();
+  const createdYear = new Date(user.created_at).getUTCFullYear();
+  const lookback = Math.max(1, Math.min(10, Number(cfg.lookback_years) || 5));
+  const startYear = Math.max(createdYear, thisYear - lookback);
+
+  // ── yearly contribution totals
   if (cfg.share_contribution_totals) {
-    const createdYear = new Date(user.created_at).getFullYear();
-    const thisYear = new Date().getFullYear();
-    const startYear = Math.max(createdYear, thisYear - 5); // cap at 5y lookback
     const years = [];
     for (let y = startYear; y <= thisYear; y++) {
       const data = await graphql(
@@ -115,10 +140,11 @@ async function main() {
             }
           }
         }`,
-        { login, from: `${y}-01-01T00:00:00Z`, to: `${y}-12-31T23:59:59Z` }
-      );
-      const c = data.user.contributionsCollection;
-      years.push({
+        { login, from: `${y}-01-01T00:00:00Z`, to: `${y}-12-31T23:59:59Z` },
+      ).catch(() => null);
+      const c = data?.user?.contributionsCollection;
+      if (!c) continue;
+      const row = {
         year: y,
         commits: c.totalCommitContributions,
         prs: c.totalPullRequestContributions,
@@ -126,64 +152,224 @@ async function main() {
         issues: c.totalIssueContributions,
         // "restricted" = private contributions GitHub already aggregates
         private_contributions: c.restrictedContributionsCount,
-      });
+      };
+      years.push(row);
+      observe("github.contribution_year", y, row);
     }
     digest.signals.contributions_by_year = years;
   }
 
-  // Repos: aggregates only. Names optional, public-only, opt-in.
+  // ── ❗upstream contributions: the strongest thing in this file, and the only
+  //    one Ravn can confirm without trusting the digest.
+  if (cfg.share_upstream_contributions && !notability.missing) {
+    const nominated = new Set(
+      (cfg.nominate_repos ?? [])
+        .map((r) => String(r ?? "").trim().toLowerCase())
+        .filter((r) => /^[a-z0-9._-]+\/[a-z0-9._-]+$/.test(r)),
+    );
+    const candidates = await upstreamCandidates(login, startYear, thisYear);
+
+    let emitted = 0;
+    for (const [nameWithOwner, seen] of candidates) {
+      const key = nameWithOwner.toLowerCase();
+      const notable = isNotable(notability, key);
+      const isNominated = nominated.has(key);
+      // ❗Public only, and on a list only. A private repository never appears
+      // here even by name, and an arbitrary public one does not either — this
+      // cannot be turned into a directory of what the reporter works on.
+      if (seen.isPrivate) continue;
+      if (!notable && !isNominated) continue;
+      if (emitted >= 100) {
+        warnings.push("upstream observation cap (100) reached");
+        break;
+      }
+
+      const merged = await mergedPrCount(key, login);
+      if (merged === 0 && seen.commits === 0) continue;
+
+      observe("github.upstream_contribution", key, {
+        merged_prs: merged,
+        prs_opened: seen.prs,
+        commits: seen.commits,
+        first_year: seen.firstYear,
+        last_year: seen.lastYear,
+        stars: seen.stars,
+        // ❗The distinction the whole design turns on. `notable` means the
+        // project is on Ravn's published, attested list. `nominated` means the
+        // reporter asked for it — carried, and never conflated with the former.
+        notable,
+        nominated: isNominated,
+        notability_set: notability.id,
+      });
+      emitted += 1;
+    }
+    digest.signals.upstream_contributions = emitted;
+  }
+
+  // ── repos, languages, orgs, security signal (v0 parity, now also observed)
   const repos = await allRepos();
   const pub = repos.filter((r) => !r.private);
   const priv = repos.filter((r) => r.private);
 
-  digest.signals.repos = {
+  const repoStats = {
     public_count: pub.length,
     ...(cfg.share_private_repo_count ? { private_count: priv.length } : {}),
     public_original_count: pub.filter((r) => !r.fork).length,
   };
+  digest.signals.repos = repoStats;
+  observe("github.repos", "", repoStats);
 
   if (cfg.share_public_repo_names) {
-    digest.signals.repos.top_public = pub
+    const top = pub
       .filter((r) => !r.fork)
       .sort((a, b) => new Date(b.pushed_at) - new Date(a.pushed_at))
       .slice(0, 10)
-      .map((r) => ({ name: r.full_name, stars: r.stargazers_count }));
+      .map((r) => ({ name: r.full_name, stars: r.stargazers_count, language: r.language }));
+    digest.signals.repos.top_public = top;
+    for (const r of top) observe("github.own_repo", r.name, r);
   }
 
   if (cfg.share_language_breakdown) {
     const langTotals = {};
     const visible = cfg.share_private_repo_count ? repos : pub;
-    for (const r of visible) if (r.language)
-      langTotals[r.language] = (langTotals[r.language] || 0) + 1;
-    digest.signals.languages = Object.fromEntries(
-      Object.entries(langTotals).sort((a, b) => b[1] - a[1]).slice(0, 8)
+    for (const r of visible) {
+      if (r.language) langTotals[r.language] = (langTotals[r.language] || 0) + 1;
+    }
+    const sorted = Object.fromEntries(
+      Object.entries(langTotals)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8),
     );
+    digest.signals.languages = sorted;
+    for (const [lang, count] of Object.entries(sorted)) {
+      observe("github.language", lang, { repos: count });
+    }
   }
 
   if (cfg.share_org_memberships) {
     const orgs = await rest(`/users/${login}/orgs`).catch(() => []);
-    digest.signals.public_orgs = orgs.map((o) => o.login);
+    const logins = orgs.map((o) => o.login);
+    digest.signals.public_orgs = logins;
+    for (const l of logins) observe("github.org", l, { login: l });
   }
 
   // Cheap "security-adjacent" heuristic over PUBLIC repos only: topic/name
   // match. A triager reads this as a hint, not a verdict.
   if (cfg.share_security_signal) {
     const KEYWORDS = /secur|vuln|cve|exploit|fuzz|sbom|vex|psirt|advisor/i;
-    digest.signals.security_adjacent_public_repos = pub.filter(
-      (r) => KEYWORDS.test(r.name) || (r.topics || []).some((t) => KEYWORDS.test(t))
+    const count = pub.filter(
+      (r) => KEYWORDS.test(r.name) || (r.topics || []).some((t) => KEYWORDS.test(t)),
     ).length;
+    digest.signals.security_adjacent_public_repos = count;
+    observe("github.security_signal", "", { count });
+  }
+
+  // ── ❗the reporter's own pointers. They ride inside the signed digest, which
+  //    makes them tamper-evident and non-repudiable — but they are TYPED as
+  //    assertions end to end, so being inside a signed envelope never makes them
+  //    verified. Ravn carries them at the DISCLOSED trust class and labels them
+  //    as the reporter's words wherever they appear.
+  for (const a of cfg.assertions ?? []) {
+    if (!a || typeof a !== "object") continue;
+    const pointer = String(a.pointer ?? "").trim();
+    if (!pointer) continue;
+    digest.assertions.push({
+      kind: String(a.kind ?? "other")
+        .trim()
+        .slice(0, 40),
+      pointer: pointer.slice(0, 200),
+      label: a.label ? String(a.label).slice(0, 200) : null,
+    });
   }
 
   writeFileSync("profile-digest.json", JSON.stringify(digest, null, 2));
   writeFileSync("profile-summary.md", summarize(digest));
-  console.log("Digest written. Keys:", Object.keys(digest.signals).join(", "));
+  console.log(
+    `Digest v1 written: ${digest.observations.length} observations, ` +
+      `${digest.assertions.length} assertions, notability set ${notability.id}.`,
+  );
+  for (const w of warnings) console.log(`  note: ${w}`);
+}
+
+/**
+ * Repositories this account actually contributed to, including ones it does not
+ * own.
+ *
+ * ❗`contributionsCollection` is the API that makes upstream work visible at all.
+ * `/user/repos` only ever shows repositories you own or are a member of — which
+ * is exactly why v0 could not see a single upstream contribution, and why the
+ * strongest available signal was missing rather than weak. Capped at one year
+ * per query by GitHub, hence the loop.
+ */
+async function upstreamCandidates(login, startYear, endYear) {
+  const seen = new Map();
+  const note = (repo, field, count, year) => {
+    if (!repo?.nameWithOwner) return;
+    const key = repo.nameWithOwner;
+    const cur = seen.get(key) ?? {
+      prs: 0,
+      commits: 0,
+      stars: repo.stargazerCount ?? 0,
+      isPrivate: !!repo.isPrivate,
+      firstYear: year,
+      lastYear: year,
+    };
+    cur[field] += count;
+    cur.firstYear = Math.min(cur.firstYear, year);
+    cur.lastYear = Math.max(cur.lastYear, year);
+    seen.set(key, cur);
+  };
+
+  for (let y = startYear; y <= endYear; y++) {
+    const data = await graphql(
+      `query($login:String!,$from:DateTime!,$to:DateTime!){
+        user(login:$login){
+          contributionsCollection(from:$from,to:$to){
+            pullRequestContributionsByRepository(maxRepositories:100){
+              repository{nameWithOwner isPrivate stargazerCount}
+              contributions{totalCount}
+            }
+            commitContributionsByRepository(maxRepositories:100){
+              repository{nameWithOwner isPrivate stargazerCount}
+              contributions{totalCount}
+            }
+          }
+        }
+      }`,
+      { login, from: `${y}-01-01T00:00:00Z`, to: `${y}-12-31T23:59:59Z` },
+    ).catch(() => null);
+    const c = data?.user?.contributionsCollection;
+    if (!c) continue;
+    for (const e of c.pullRequestContributionsByRepository ?? []) {
+      note(e.repository, "prs", e.contributions?.totalCount ?? 0, y);
+    }
+    for (const e of c.commitContributionsByRepository ?? []) {
+      note(e.repository, "commits", e.contributions?.totalCount ?? 0, y);
+    }
+  }
+  return seen;
+}
+
+/**
+ * Merged PRs by this account into this repository.
+ *
+ * ❗The number Ravn re-checks, so it is the number worth collecting. An
+ * opened-PR count is not the same claim: anyone can open a pull request, and
+ * "merged" is the word that means a maintainer agreed.
+ */
+async function mergedPrCount(nameWithOwner, login) {
+  const data = await graphql(
+    `query($q:String!){ search(query:$q, type:ISSUE, first:1){ issueCount } }`,
+    { q: `repo:${nameWithOwner} author:${login} is:pr is:merged` },
+  ).catch(() => null);
+  return data?.search?.issueCount ?? 0;
 }
 
 async function allRepos() {
   const out = [];
   for (let page = 1; page <= 10; page++) {
     const batch = await rest(
-      `/user/repos?per_page=100&page=${page}&affiliation=owner,collaborator,organization_member`
+      `/user/repos?per_page=100&page=${page}&affiliation=owner,collaborator,organization_member`,
     ).catch(() => []);
     out.push(...batch);
     if (batch.length < 100) break;
@@ -197,22 +383,61 @@ function summarize(d) {
     `# Ravn Profile Digest — ${d.subject.github_login}`,
     ``,
     `Generated: ${d.generated_at}`,
+    `Schema: ${d.schema} · notability set: ${d.notability.set}`,
     ``,
   ];
-  if (s.account)
-    lines.push(`- Account age: ${s.account.account_age_days} days (${s.account.followers} followers)`);
-  if (s.repos)
-    lines.push(`- Public repos: ${s.repos.public_count} (${s.repos.public_original_count} original)` +
-      (s.repos.private_count != null ? `, private: ${s.repos.private_count}` : ""));
+
+  const upstream = d.observations.filter((o) => o.type === "github.upstream_contribution");
+  const notable = upstream.filter((o) => o.payload.notable);
+  if (notable.length) {
+    lines.push(`## Upstream contributions (${notable.length} notable projects)`, ``);
+    for (const o of notable
+      .slice()
+      .sort((a, b) => b.payload.merged_prs - a.payload.merged_prs)
+      .slice(0, 20)) {
+      lines.push(
+        `- **${o.subject}** — ${o.payload.merged_prs} merged PRs, ${o.payload.commits} commits`,
+      );
+    }
+    lines.push(``);
+  }
+  const nominated = upstream.filter((o) => !o.payload.notable && o.payload.nominated);
+  if (nominated.length) {
+    lines.push(`## Nominated by you (not on Ravn's notability list)`, ``);
+    for (const o of nominated) lines.push(`- ${o.subject} — ${o.payload.merged_prs} merged PRs`);
+    lines.push(``);
+  }
+
+  lines.push(`## Account`, ``);
+  if (s.account) {
+    lines.push(
+      `- Account age: ${s.account.account_age_days} days (${s.account.followers} followers)`,
+    );
+  }
+  if (s.repos) {
+    lines.push(
+      `- Public repos: ${s.repos.public_count} (${s.repos.public_original_count} original)` +
+        (s.repos.private_count != null ? `, private: ${s.repos.private_count}` : ""),
+    );
+  }
   if (s.contributions_by_year) {
     const total = s.contributions_by_year.reduce((n, y) => n + y.commits + y.prs, 0);
     lines.push(`- ${total} commits+PRs across ${s.contributions_by_year.length} years`);
   }
-  if (s.languages)
-    lines.push(`- Top languages: ${Object.keys(s.languages).join(", ")}`);
-  if (s.security_adjacent_public_repos != null)
+  if (s.languages) lines.push(`- Top languages: ${Object.keys(s.languages).join(", ")}`);
+  if (s.security_adjacent_public_repos != null) {
     lines.push(`- Security-adjacent public repos: ${s.security_adjacent_public_repos}`);
-  return lines.join("\n") + "\n";
+  }
+
+  if (d.assertions.length) {
+    lines.push(``, `## Your own assertions (Ravn has not verified these)`, ``);
+    for (const a of d.assertions) lines.push(`- ${a.label ?? a.pointer} — ${a.pointer}`);
+  }
+  if (d.warnings?.length) {
+    lines.push(``, `## Notes`, ``);
+    for (const w of d.warnings) lines.push(`- ${w}`);
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 main().catch((e) => {
