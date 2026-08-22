@@ -1,0 +1,143 @@
+# Ravn notability set — projects a contribution to is worth asserting.
+#
+# set: ravn-notable/2026-08
+#
+# ❗THE REPORTER DOES NOT DECIDE WHAT IS NOTABLE. This list does, and it ships
+# INSIDE ravn-actions at the same commit the collector is pinned to — so the
+# attested `job_workflow_sha` covers the list as well as the code. A fork with a
+# padded list produces a different SHA and fails verification, exactly as a
+# modified collector does.
+#
+# That is also why this is not fetched at runtime. A list pulled from the network
+# mid-run is a list nobody attested, and "which version of the list ran" would
+# become unanswerable at precisely the moment it mattered.
+#
+# GOVERNANCE, same shape as approved-workflow-shas.txt:
+#   • one `owner/repo` per line, lowercase, no trailing slash;
+#   • `#` comments and blank lines ignored;
+#   • additions are a PR to this file, which forces a new approved SHA — a
+#     deliberate speed bump, because this file decides what "well-known" means.
+#
+# ❗Absence from this list is NOT a judgement about a project. It means Ravn has
+# not curated it yet. A reporter can nominate any repository via `nominate_repos`
+# in ravn.config.yml; it is then carried as their assertion rather than as a
+# notable-project claim, and shown that way.
+#
+# Selection principle: broadly depended upon, or squarely in the security domain
+# — the two cases where "this person has contributed here" tells a PSIRT team
+# something useful about who is filing their report.
+
+# ── language runtimes, compilers, core toolchains
+golang/go
+rust-lang/rust
+python/cpython
+nodejs/node
+openjdk/jdk
+llvm/llvm-project
+ruby/ruby
+php/php-src
+dotnet/runtime
+
+# ── operating systems and low-level
+torvalds/linux
+systemd/systemd
+openbsd/src
+freebsd/freebsd-src
+
+# ── cryptography and TLS
+openssl/openssl
+libressl/portable
+google/boringssl
+jedisct1/libsodium
+pyca/cryptography
+rustls/rustls
+
+# ── container, orchestration, cloud-native
+kubernetes/kubernetes
+moby/moby
+containerd/containerd
+opencontainers/runc
+etcd-io/etcd
+istio/istio
+envoyproxy/envoy
+helm/helm
+argoproj/argo-cd
+cilium/cilium
+open-policy-agent/opa
+
+# ── web servers, proxies, gateways
+nginx/nginx
+apache/httpd
+caddyserver/caddy
+haproxy/haproxy
+traefik/traefik
+
+# ── databases and data infrastructure
+postgres/postgres
+redis/redis
+apache/kafka
+elastic/elasticsearch
+mongodb/mongo
+sqlite/sqlite
+
+# ── security tooling
+OWASP/CheatSheetSeries
+zaproxy/zaproxy
+projectdiscovery/nuclei
+projectdiscovery/subfinder
+aquasecurity/trivy
+anchore/syft
+anchore/grype
+sigstore/cosign
+sigstore/sigstore
+slsa-framework/slsa
+openssf/scorecard
+google/oss-fuzz
+rapid7/metasploit-framework
+sqlmapproject/sqlmap
+wireshark/wireshark
+radareorg/radare2
+NationalSecurityAgency/ghidra
+hashicorp/vault
+keycloak/keycloak
+ory/hydra
+CISOfy/lynis
+falcosecurity/falco
+
+# ── supply chain, identity, standards
+in-toto/in-toto
+notaryproject/notation
+spiffe/spire
+openid/AppAuth-Android
+w3c/webappsec
+
+# ── widely depended-upon libraries
+curl/curl
+libgit2/libgit2
+madler/zlib
+libexpat/libexpat
+FFmpeg/FFmpeg
+ImageMagick/ImageMagick
+libarchive/libarchive
+protocolbuffers/protobuf
+grpc/grpc
+openssl/openssl-book
+
+# ── major application frameworks
+facebook/react
+angular/angular
+vuejs/core
+django/django
+pallets/flask
+rails/rails
+spring-projects/spring-framework
+expressjs/express
+laravel/framework
+dotnet/aspnetcore
+
+# ── infrastructure as code and CI
+hashicorp/terraform
+opentofu/opentofu
+ansible/ansible
+actions/runner
+jenkinsci/jenkins

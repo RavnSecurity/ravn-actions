@@ -235,6 +235,85 @@ if ! confirm "Keep these as-is?" Y; then
   fi
 fi
 
+# ---------- 5b. what else should count? ----------
+#
+# Ravn cannot enumerate every project or platform that matters, and pretending
+# otherwise is how good reporters get under-read. So we ask.
+#
+# ❗Everything captured here is carried as the reporter's OWN assertion and is
+# labelled that way end to end. Riding inside the signed digest makes it
+# tamper-evident and non-repudiable; it never makes it verified.
+
+# ❗Splice under the KEY, never append at EOF. `ravn.config.yml` ends with the
+# assertions block, so a `>>` append files nominated repositories as assertions —
+# silently, and the digest looks fine.
+yaml_splice() { # $1 = top-level key, $2 = file of lines to insert beneath it
+  _tmp=$(mktemp)
+  awk -v key="$1:" -v ins="$2" '
+    { print }
+    !done && $0 == key { while ((getline line < ins) > 0) print line; close(ins); done = 1 }
+  ' "$CONFIG_FILE" > "$_tmp" && mv "$_tmp" "$CONFIG_FILE"
+  rm -f "$2"
+}
+
+step "Anything else we should count?"
+info "Ravn checks a published list of notable projects automatically."
+info "You can also point us at work that list misses."
+
+if confirm "Nominate repositories you have contributed to?" N; then
+  PENDING=$(mktemp)
+  while true; do
+    printf '  owner/repo (blank to finish): '
+    read -r nr || break
+    [ -z "$nr" ] && break
+    case "$nr" in
+      */*) printf '  - %s\n' "$nr" >> "$PENDING"; ok "Added $nr." ;;
+      *) warn "Expected owner/repo — skipped." ;;
+    esac
+  done
+  if [ -s "$PENDING" ]; then
+    sed -i.bak 's/^nominate_repos: \[\]$/nominate_repos:/' "$CONFIG_FILE" && rm -f "$CONFIG_FILE.bak"
+    yaml_splice nominate_repos "$PENDING"
+  else
+    rm -f "$PENDING"
+  fi
+fi
+
+if confirm "Point us at anything else (another platform, a CVE, a package, a talk)?" N; then
+  PENDING=$(mktemp)
+  while true; do
+    printf '  URL (blank to finish): '
+    read -r ptr || break
+    [ -z "$ptr" ] && break
+    printf '  what kind is it? [profile/advisory/package/talk/other]: '
+    read -r knd || knd=other
+    [ -z "$knd" ] && knd=other
+    printf '  short label: '
+    read -r lbl || lbl=""
+    [ -z "$lbl" ] && lbl="$ptr"
+    {
+      printf '  - kind: %s\n' "$knd"
+      printf '    pointer: %s\n' "$ptr"
+      printf '    label: %s\n' "$lbl"
+    } >> "$PENDING"
+    ok "Added $lbl."
+  done
+  if [ -s "$PENDING" ]; then
+    sed -i.bak 's/^assertions: \[\]$/assertions:/' "$CONFIG_FILE" && rm -f "$CONFIG_FILE.bak"
+    yaml_splice assertions "$PENDING"
+    info "Ravn cannot verify these yet — they are shown labelled as YOUR assertion."
+    info "What reporters point at most often is what Ravn builds next."
+  else
+    rm -f "$PENDING"
+  fi
+fi
+
+if ! git diff --quiet -- "$CONFIG_FILE"; then
+  git commit -qam "Add nominations and assertions to ravn.config.yml"
+  git push -q
+  ok "Pushed updated $CONFIG_FILE."
+fi
+
 # ---------- 6. run the collector ----------
 step "Running the collector"
 gh workflow run "$WORKFLOW_NAME" --repo "$REPO"
