@@ -9,3 +9,5 @@
 23eca48b197c67ccb98fc259f8d7953ebf497fa5
 # e6d0c5acbc9f7e5aacb907aa073b41aae70c3c18 2026-08-10 in-run bundle assembly + create-or-update onboarding (ravn-platform#154 stage-0.5)
 e6d0c5acbc9f7e5aacb907aa073b41aae70c3c18
+# d360e1a6d301470b55eed97354dc8c973fff7dd8 2026-08-22 digest v1: upstream contributions, notability set, assertions (ravn-platform#226)
+d360e1a6d301470b55eed97354dc8c973fff7dd8
