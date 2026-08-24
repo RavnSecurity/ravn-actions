@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "type": "profile",
+  "collectors": [
+    {
+      "provider": "github",
+      "required": { "secrets": ["RAVN_READONLY_TOKEN"] },
+      "metadata": {}
+    },
+    {
+      "provider": "hackerone",
+      "required": { "secrets": ["H1_TOKEN"] },
+      "metadata": {}
+    }
+  ]
+}

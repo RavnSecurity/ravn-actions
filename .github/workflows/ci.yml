@@ -1,0 +1,32 @@
+# Repo gate. Cheap by design: no build, no dependencies, no install step —
+# Node's own test runner against loopback mocks.
+#
+# ❗What this is really guarding is the D12/D7 property: that the delivered
+# config and the job id sit inside the bytes `attest-build-provenance` hashes.
+# That is a property nobody notices breaking — a digest with the fields hanging
+# off the envelope instead looks completely normal and verifies perfectly.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Matches the collector workflow's runtime, so a test passing here
+          # means it passes where the collector actually runs.
+          node-version: 20
+      - run: node --test test/*.test.mjs

@@ -1,141 +1,53 @@
 /**
- * ravn.config.yml — a deliberately small YAML subset.
+ * Sharing preferences — the "redaction config" that decides what the collector
+ * is allowed to look at, and therefore what ends up in the digest.
  *
- * ❗Why not a YAML library: this script runs in the reporter's own Actions
- * environment, and the reporter is a security person who can and should read it
- * before handing it a token. A dependency-free parser they can audit in two
- * minutes is worth more here than full YAML support. `npm install` in the
- * collector step would also mean the attested SHA no longer pins everything
- * that runs.
+ * ── What changed, and why ──────────────────────────────────────────────────
  *
- * What it supports, which is all the config format needs:
+ * These preferences used to arrive as `ravn.config.yml`, a file in the
+ * reporter's own repository, parsed here by a hand-rolled YAML subset. That
+ * file is retired (ADR security-005 D12/§4). They now arrive over an
+ * authenticated, per-run channel: the collector presents a GitHub OIDC token to
+ * Ravn and is handed a `ravn.collection-config/v1` document back.
  *
- *     key: true                 # booleans
- *     key: 12                   # numbers
- *     key: some text            # strings
- *     key:                      # a list of scalars
- *       - one
- *       - two
- *     key:                      # a list of maps, one level deep
- *       - kind: profile
- *         pointer: https://...
+ * ❗The retirement changes WHERE the config comes from and nothing about who it
+ * belongs to. Server-delivered config introduces a failure mode the file did
+ * not have — the reporter can no longer read what they agreed to share — so two
+ * things are load-bearing and neither is optional:
  *
- * Anything else is ignored rather than fataled. ❗A reporter's typo must not cost
- * them a collection run — the digest records what was parsed, so an option that
- * silently did not apply is visible in the output rather than mysterious.
+ *   1. `scripts/fetch-config.mjs` prints the delivered document verbatim to the
+ *      run log BEFORE anything is collected, while the reporter can still
+ *      cancel the run.
+ *   2. `collect.mjs` embeds it in `profile-digest.json` BEFORE hashing, exactly
+ *      as the local file was, so it is covered by the signature and a triager
+ *      verifying the bundle can see what was withheld.
+ *
+ * Without both, "what you share" silently moves from the reporter to Ravn's
+ * server and security-004's central promise stops being true.
+ *
+ * ── Where the preferences live in the delivered document ───────────────────
+ *
+ * The v1 config is a list of `collectors`, each with a `provider` and a
+ * per-provider `metadata` object that the contract leaves deliberately
+ * unconstrained. The GitHub collector's sharing preferences are that object:
+ *
+ *     { "version": 1, "type": "profile", "collectors": [
+ *         { "provider": "github",
+ *           "required": { "secrets": ["RAVN_READONLY_TOKEN"] },
+ *           "metadata": { "share_org_memberships": true, "lookback_years": 3 } } ] }
+ *
+ * Keys are the same ones `ravn.config.yml` carried, so a reporter's answers
+ * mean what they always meant and a digest reads the same either side of the
+ * move.
  */
-
-const stripComment = (line) => {
-  // Only strip a '#' that starts a comment, not one inside a quoted value.
-  let out = "";
-  let quote = null;
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i];
-    if (quote) {
-      if (ch === quote) quote = null;
-      out += ch;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      out += ch;
-      continue;
-    }
-    if (ch === "#") break;
-    out += ch;
-  }
-  return out;
-};
-
-const unquote = (v) => {
-  const t = v.trim();
-  if (t.length >= 2 && (t[0] === '"' || t[0] === "'") && t[t.length - 1] === t[0]) {
-    return t.slice(1, -1);
-  }
-  return t;
-};
-
-const scalar = (raw) => {
-  const v = unquote(raw);
-  if (v === "true") return true;
-  if (v === "false") return false;
-  if (v === "" || v === "null" || v === "~") return null;
-  if (/^-?\d+$/.test(v)) return Number(v);
-  return v;
-};
-
-/** Parse the subset above into a plain object. Never throws. */
-export function parseConfig(text) {
-  const out = {};
-  const lines = String(text ?? "").split(/\r?\n/);
-
-  let listKey = null; // the key whose list we are inside
-  let listItem = null; // the map currently being built, if the list holds maps
-  let itemIndent = 0;
-
-  const closeItem = () => {
-    if (listKey && listItem && Object.keys(listItem).length > 0) out[listKey].push(listItem);
-    listItem = null;
-  };
-  const closeList = () => {
-    closeItem();
-    listKey = null;
-  };
-
-  for (const rawLine of lines) {
-    const line = stripComment(rawLine);
-    if (!line.trim()) continue;
-    const indent = line.length - line.trimStart().length;
-    const trimmed = line.trim();
-
-    // A list entry.
-    if (trimmed.startsWith("- ") || trimmed === "-") {
-      if (!listKey) continue; // a dash with no list above it: ignore.
-      const rest = trimmed.slice(1).trim();
-      const kv = rest.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
-      if (kv) {
-        // A map entry starts here; anything more-indented below belongs to it.
-        closeItem();
-        listItem = { [kv[1]]: scalar(kv[2]) };
-        itemIndent = indent;
-      } else if (rest) {
-        closeItem();
-        out[listKey].push(scalar(rest));
-      }
-      continue;
-    }
-
-    // A continuation of the map begun by the last '-' entry.
-    if (listItem && indent > itemIndent) {
-      const kv = trimmed.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
-      if (kv) listItem[kv[1]] = scalar(kv[2]);
-      continue;
-    }
-
-    // A top-level key.
-    const kv = trimmed.match(/^([A-Za-z0-9_-]+)\s*:\s*(.*)$/);
-    if (!kv) continue;
-    closeList();
-    const [, key, value] = kv;
-    if (value.trim() === "") {
-      // Either an empty value or the head of a list. Assume list; if nothing
-      // follows, an empty array is a harmless and accurate answer.
-      out[key] = [];
-      listKey = key;
-    } else {
-      out[key] = scalar(value);
-    }
-  }
-  closeList();
-  return out;
-}
 
 /**
  * Sharing preferences, with conservative defaults.
  *
  * ❗Every default that could expose something stays false. The reporter opts IN
  * to detail; nothing is opted in on their behalf, including by a future edit to
- * this list.
+ * this list — and including by a config Ravn delivers, since an absent key
+ * resolves to the default below rather than to whatever the server prefers.
  */
 export const DEFAULTS = {
   share_account_age: true,
@@ -171,12 +83,21 @@ export const DEFAULTS = {
   assertions: [],
 };
 
-/** Merge parsed config over the defaults, keeping only keys we know. */
-export function resolveConfig(text) {
-  const parsed = parseConfig(text);
+/**
+ * Merge a provider's `metadata` over the defaults, keeping only keys we know.
+ *
+ * ❗Unknown keys are IGNORED here and reported, not fataled. Ravn's write side
+ * refuses an unknown key at job-creation time, where a human is present to fix
+ * it; by the time a document reaches a runner the reporter cannot edit it, and
+ * losing a whole collection run to a key this version does not understand would
+ * be the wrong trade. The digest records what was actually parsed, so an option
+ * that silently did not apply is visible in the output rather than mysterious.
+ */
+export function resolveConfig(metadata) {
   const cfg = { ...DEFAULTS };
   const unknown = [];
-  for (const [k, v] of Object.entries(parsed)) {
+  const source = metadata && typeof metadata === "object" && !Array.isArray(metadata) ? metadata : {};
+  for (const [k, v] of Object.entries(source)) {
     if (!(k in cfg)) {
       unknown.push(k);
       continue;

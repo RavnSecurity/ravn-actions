@@ -20,7 +20,7 @@
 #
 # ❗Absence from this list is NOT a judgement about a project. It means Ravn has
 # not curated it yet. A reporter can nominate any repository via `nominate_repos`
-# in ravn.config.yml; it is then carried as their assertion rather than as a
+# in their collection config; it is then carried as their assertion rather than as a
 # notable-project claim, and shown that way.
 #
 # Selection principle: broadly depended upon, or squarely in the security domain

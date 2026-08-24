@@ -8,21 +8,34 @@
 # swap the action body and the provenance would look identical. With a reusable workflow,
 # Ravn can verify server-side that the digest was produced by an approved workflow version,
 # regardless of what else the caller's workflow does before/after.
+#
+# ❗The SAME claim is what authenticates the config fetch below (ADR security-005 D3/D13).
+# A fetch step in the CALLER's workflow would present a token naming the caller's own file —
+# self-referential, and it proves nothing. The fetch belongs here, in the workflow the
+# signing certificate actually names. Do not move it.
 name: Ravn Profile Collection
 
 on:
   workflow_call:
     inputs:
-      config-path:
-        description: Path to ravn.config.yml in the caller's repo
+      ravn-base-url:
+        description: >
+          Base URL of Ravn's API, where the collector fetches this run's config.
+          An input rather than a constant so a staging control plane, or a local
+          mock during development, is a caller-side change and not a new
+          collector SHA to approve.
         type: string
-        default: ravn.config.yml
+        default: https://api.ravnsecurity.io
     secrets:
       RAVN_READONLY_TOKEN:
         description: >
           Fine-grained PAT with read-only scopes (contents: none needed; just
           "Read access to metadata" + account-level read). Used to see the
           user's full activity picture. Only aggregates ever leave the runner.
+
+          ❗Deliberately NOT named GH_TOKEN: that is the GitHub CLI's own
+          credential variable, and using it would make the reporter's PAT the
+          ambient credential for every tool in the job.
         required: false
 
 jobs:
@@ -30,23 +43,19 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write        # OIDC token for Sigstore signing
+      id-token: write        # OIDC token: config fetch (security-005) AND Sigstore signing
       attestations: write    # write to the attestations API
     steps:
-      # Caller's repo: only needed to read their ravn.config.yml
-      - name: Checkout caller config
-        uses: actions/checkout@v4
-        with:
-          sparse-checkout: |
-            ${{ inputs.config-path }}
-          sparse-checkout-cone-mode: false
-
       # Ravn's collection script, pinned to the SAME commit as this workflow file.
       # The attested claim (job_workflow_ref + job_workflow_sha in the signing cert)
       # covers only THIS FILE's SHA — checking out a branch here would let the script
       # drift from the attested workflow version, so code and claim could diverge
       # (the script-pin gap, RavnSecurity/ravn-platform#133). Riding
       # github.job_workflow_sha extends the verified claim to the collector code.
+      #
+      # ❗The caller's repo is no longer checked out at all. It was only ever needed
+      # to read `ravn.config.yml`, which security-005 retires — so the collector now
+      # touches nothing in the repository it runs in.
       - name: Checkout ravn-actions (pinned)
         uses: actions/checkout@v4
         with:
@@ -59,6 +68,23 @@ jobs:
         with:
           node-version: 20
 
+      # Authenticate to Ravn with this job's OIDC token, fetch the config, print
+      # it, and check required secrets — all BEFORE any collection. A refusal
+      # (no active job, wrong repo, expired, locked, not workflow_dispatch) stops
+      # the run here, naming the code and the page that fixes it.
+      #
+      # ❗The print is not decoration. Server-delivered config means the reporter
+      # can no longer read a file to see what they agreed to share, so the run log
+      # is where they see it — while they can still cancel (D12).
+      - name: Fetch collection config (OIDC)
+        env:
+          RAVN_BASE_URL: ${{ inputs.ravn-base-url }}
+          # Named in the config's `required.secrets`; read here so preflight can
+          # tell the reporter which secret is missing instead of producing a thin
+          # digest an hour later. Empty when unset, which is what preflight checks.
+          RAVN_READONLY_TOKEN: ${{ secrets.RAVN_READONLY_TOKEN }}
+        run: node .ravn-actions/scripts/fetch-config.mjs
+
       - name: Collect + digest
         id: collect
         env:
@@ -66,7 +92,6 @@ jobs:
           # GITHUB_TOKEN, which only sees this repo — still useful for a
           # public-only digest.
           RAVN_TOKEN: ${{ secrets.RAVN_READONLY_TOKEN || github.token }}
-          RAVN_CONFIG_PATH: ${{ inputs.config-path }}
           RAVN_ACTOR: ${{ github.actor }}
         run: |
           node .ravn-actions/scripts/collect.mjs
@@ -75,6 +100,10 @@ jobs:
       # Signed SLSA provenance for the digest. The predicate records the
       # runner environment, the caller repo/ref, and job_workflow_ref (this
       # file @ SHA). Verifiable later with `gh attestation verify`.
+      #
+      # ❗Everything that matters is INSIDE profile-digest.json before this step
+      # runs — the resolved config and the job id included. This step hashes the
+      # file; anything added after it, or carried beside it, is not signed.
       - name: Attest digest
         id: attest
         uses: actions/attest-build-provenance@v2
