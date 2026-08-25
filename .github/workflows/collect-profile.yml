@@ -25,7 +25,7 @@ on:
           mock during development, is a caller-side change and not a new
           collector SHA to approve.
         type: string
-        default: https://api.ravnsecurity.io
+        default: https://apps.ravnsecurity.io/api/reputation
     secrets:
       RAVN_READONLY_TOKEN:
         description: >
@@ -46,12 +46,157 @@ jobs:
       id-token: write        # OIDC token: config fetch (security-005) AND Sigstore signing
       attestations: write    # write to the attestations API
     steps:
-      # Ravn's collection script, pinned to the SAME commit as this workflow file.
-      # The attested claim (job_workflow_ref + job_workflow_sha in the signing cert)
-      # covers only THIS FILE's SHA — checking out a branch here would let the script
-      # drift from the attested workflow version, so code and claim could diverge
-      # (the script-pin gap, RavnSecurity/ravn-platform#133). Riding
-      # github.job_workflow_sha extends the verified claim to the collector code.
+      # ── The script pin. This step is the fix for RavnSecurity/ravn-actions#8.
+      #
+      # ❗`github.job_workflow_sha` is EMPTY inside a reusable workflow — measured,
+      # not inferred — and `actions/checkout` given an empty `ref` silently falls
+      # back to the repository's DEFAULT BRANCH. This step used to read that
+      # context value, so the signed attestation named collector SHA X while the
+      # code that actually ran was whatever `main` held at the time. It failed
+      # open, and it failed silently: a run with the wrong code goes green.
+      #
+      # The OIDC token is the one place the value is actually populated, so that
+      # is where it is read from now. The step is deliberately INLINE, using only
+      # what the runner already ships (bash, curl, jq, base64), for two reasons:
+      #
+      #   - ordering: the scripts that could otherwise do this live inside the
+      #     checkout that has not happened yet. Running one first would be the
+      #     exact inversion the pin exists to prevent — unverified code deciding
+      #     which code is verified;
+      #   - trust: THIS FILE is what the signing certificate names, so logic
+      #     inline here is covered by the attested claim. Logic in a checked-out
+      #     script is precisely what is not yet trustworthy at this point.
+      #
+      # ❗The token is DECODED, not verified, and that is correct here. GitHub
+      # minted it for this job seconds earlier over an authenticated loopback
+      # endpoint that no other process can reach, and Ravn re-verifies the same
+      # `job_workflow_sha` claim server-side on ingest — so a tampered value is
+      # rejected there rather than producing a trusted digest. Verifying the
+      # signature locally would mean JWKS fetching and crypto in a step whose
+      # whole premise is that it depends on nothing.
+      #
+      # ❗It mints its OWN token rather than handing one to the config fetch
+      # below. A shared token has to survive in a step output or the environment,
+      # which is a live JWT one `set -x` or one careless `echo` away from the run
+      # log. Minting twice costs a loopback call and keeps each credential inside
+      # the step that uses it.
+      - name: Resolve attested collector SHA (OIDC)
+        id: pin
+        shell: bash
+        env:
+          RAVN_OIDC_AUDIENCE: https://ravnsecurity.io
+          # Printed for comparison only, never used. Expected to be empty; if it
+          # ever stops being empty, this step's log is where that turns up.
+          CTX_JOB_WORKFLOW_SHA: ${{ github.job_workflow_sha }}
+          # The claim must name THIS file in THIS repository. When
+          # collect-profile.yml is not invoked as a cross-repo reusable workflow,
+          # `job_workflow_sha` names the CALLER's workflow — a real SHA, of the
+          # wrong repository, which would otherwise fail later as a confusing git
+          # error instead of here as a clear one. (A fork testing its own
+          # collector has to change this.)
+          EXPECT_REF_PREFIX: RavnSecurity/ravn-actions/.github/workflows/collect-profile.yml@
+        run: |
+          # --- ravn:pin-resolver:begin ---
+          # ❗The body between these markers is executed verbatim by
+          # test/pin-collector.test.mjs, which extracts it from this file rather
+          # than keeping a copy. The failure mode being guarded is silence, so the
+          # tested text and the shipped text must be the same text.
+          set -euo pipefail
+
+          die() {
+            echo "::error::$1"
+            shift
+            [ "$#" -eq 0 ] || printf '%s\n' "$@"
+            echo "Nothing has been checked out, and nothing has been collected."
+            exit 1
+          }
+
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            die "No OIDC token endpoint is available to this job." \
+                "ACTIONS_ID_TOKEN_REQUEST_URL is empty, which means one of:" \
+                "  - the job is missing 'permissions: id-token: write';" \
+                "  - an organisation or enterprise policy disables OIDC for this repository;" \
+                "  - this is not a GitHub-hosted Actions run at all." \
+                "The attested collector SHA can only be read from that token."
+          fi
+
+          if ! response=$(curl -sS --max-time 30 \
+                -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+                -H "Accept: application/json" \
+                "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${RAVN_OIDC_AUDIENCE}"); then
+            die "Could not reach the Actions OIDC token endpoint."
+          fi
+
+          token=$(printf '%s' "$response" | jq -r '.value // empty')
+          [ -n "$token" ] || die "The Actions OIDC endpoint returned no token value."
+          echo "::add-mask::${token}"
+
+          # A JWT is header.payload.signature; the claims are the middle segment.
+          payload=${token#*.}
+          payload=${payload%%.*}
+          if [ -z "$payload" ] || [ "$payload" = "$token" ]; then
+            die "The Actions OIDC endpoint returned something that is not a JWT."
+          fi
+
+          # ❗JWT segments are base64URL WITHOUT PADDING: '-' and '_' stand in for
+          # '+' and '/', and trailing '=' is stripped. `base64 -d` speaks neither
+          # dialect. Translate the alphabet and restore the padding, or the decode
+          # fails on most tokens and succeeds on some — which reads as flaky
+          # rather than as wrong, and is the worst way for this to break.
+          b64=$(printf '%s' "$payload" | tr '_-' '/+')
+          case $(( ${#b64} % 4 )) in
+            0) ;;
+            2) b64="${b64}==" ;;
+            3) b64="${b64}=" ;;
+            *) die "The OIDC token payload is not valid base64url (impossible length)." ;;
+          esac
+
+          if ! claims=$(printf '%s' "$b64" | base64 -d 2>/dev/null); then
+            die "Could not base64url-decode the OIDC token payload."
+          fi
+          if ! printf '%s' "$claims" | jq -e . >/dev/null 2>&1; then
+            die "The OIDC token payload did not decode to JSON."
+          fi
+
+          sha=$(printf '%s' "$claims" | jq -r '.job_workflow_sha // empty')
+          ref=$(printf '%s' "$claims" | jq -r '.job_workflow_ref // empty')
+
+          # ⚠️ FAIL CLOSED, here and below. Missing, empty or malformed aborts the
+          # run. There is deliberately NO fallback — not to a branch, not to
+          # github.sha, not to the context value: falling back is the entire bug
+          # this step replaces, and it is invisible when it happens.
+          if [ -z "$sha" ]; then
+            die "The OIDC token carries no usable 'job_workflow_sha' claim (absent, or present and empty)." \
+                "Refusing to check the collector out, because the only remaining options" \
+                "are a branch or a guess — and either one signs a digest for code that" \
+                "nobody attested."
+          fi
+          if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            die "The 'job_workflow_sha' claim is not a 40-character commit SHA: '${sha}'" \
+                "Refusing to check the collector out."
+          fi
+          case "$ref" in
+            "${EXPECT_REF_PREFIX}"*) ;;
+            *) die "The OIDC token's 'job_workflow_ref' does not name this collector: '${ref}'" \
+                   "Expected it to start with '${EXPECT_REF_PREFIX}'." \
+                   "This is what a non-cross-repo invocation looks like: job_workflow_sha is" \
+                   "then a real SHA of the CALLER's workflow file, in the wrong repository." ;;
+          esac
+
+          echo "Collector SHA resolved from OIDC claim job_workflow_sha: ${sha}"
+          echo "  job_workflow_ref:                                     ${ref}"
+          echo "  github.job_workflow_sha (context, unused, expected empty): '${CTX_JOB_WORKFLOW_SHA:-}'"
+          echo "sha=${sha}" >> "${GITHUB_OUTPUT:?GITHUB_OUTPUT is not set}"
+          # --- ravn:pin-resolver:end ---
+
+      # Ravn's collection script, at the SAME commit as this workflow file — the
+      # one the signing certificate names. Checking out a branch here would let
+      # the script drift from the attested workflow version, so code and claim
+      # could diverge (the script-pin gap, RavnSecurity/ravn-platform#133).
+      #
+      # ❗`ref` comes from the step above, not from `github.job_workflow_sha`.
+      # See #8: that context value is empty here and checkout treats an empty ref
+      # as "give me the default branch".
       #
       # ❗The caller's repo is no longer checked out at all. It was only ever needed
       # to read `ravn.config.yml`, which security-005 retires — so the collector now
@@ -60,8 +205,27 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: RavnSecurity/ravn-actions
-          ref: ${{ github.job_workflow_sha }}
+          ref: ${{ steps.pin.outputs.sha }}
           path: .ravn-actions
+
+      # A pin is worth what it can be shown to be worth, and "checkout resolved
+      # the ref to something else" is the precise shape of #8. So assert it, and
+      # print both SHAs: this is the line a live cross-repo dispatch is checked
+      # against in the run log.
+      - name: Verify the checkout is at the attested commit
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ steps.pin.outputs.sha }}
+        run: |
+          set -euo pipefail
+          actual=$(git -C .ravn-actions rev-parse HEAD)
+          echo "collector checkout HEAD:   ${actual}"
+          echo "attested job_workflow_sha: ${EXPECTED_SHA}"
+          if [ "$actual" != "$EXPECTED_SHA" ]; then
+            echo "::error::Collector checkout is at ${actual}, not the attested ${EXPECTED_SHA}. Refusing to collect."
+            exit 1
+          fi
+          echo "Collector code and attested claim agree at ${EXPECTED_SHA}."
 
       - name: Setup Node
         uses: actions/setup-node@v4
