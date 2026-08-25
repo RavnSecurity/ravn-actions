@@ -23,7 +23,42 @@ const envFor = (ravn, extra = {}) => ({
   ACTIONS_ID_TOKEN_REQUEST_TOKEN: "runtime-request-token",
   RAVN_BASE_URL: ravn.origin,
   RAVN_READONLY_TOKEN: "ghp_fake_readonly",
+  // ❗Present because the shared fixture asks for the `hackerone` collector too,
+  //   and that provider is implemented now. Preflight refuses a run whose config
+  //   names a secret the runner does not have — which is the whole point of it,
+  //   and is what caught this fixture naming `H1_TOKEN`, a name no collector has
+  //   ever read.
+  H1_API_IDENTIFIER: "ravn-collector-token",
+  H1_API_TOKEN: "h1_fake_token",
   ...extra,
+});
+
+test("a provider this collector version cannot run is skipped, not demanded", async () => {
+  /*
+   * ❗The property, kept alive after `hackerone` stopped being the example of
+   * it. A config naming a provider we have not built yet must warn and carry on
+   * — not fail preflight demanding a secret that nothing would read. That is a
+   * forward-compatibility promise: Ravn can start delivering a new provider
+   * before every reporter's pinned collector SHA understands it.
+   */
+  const config = {
+    version: 1,
+    type: "profile",
+    collectors: [
+      { provider: "github", required: { secrets: ["RAVN_READONLY_TOKEN"] }, metadata: {} },
+      { provider: "gitlab", required: { secrets: ["GITLAB_TOKEN"] }, metadata: {} },
+    ],
+  };
+  const ravn = await startRavn({ respond: () => ({ status: 200, body: { job: JOB, config } }) });
+  const cwd = scratch();
+  const r = await run("fetch-config.mjs", { cwd, env: envFor(ravn) });
+  await ravn.close();
+
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.stdout, /::warning::Config asks for provider 'gitlab'/);
+  assert.match(r.stdout, /Preflight OK — providers to run: github/);
+  // And crucially: it did NOT demand GITLAB_TOKEN, which nothing would read.
+  assert.ok(!/GITLAB_TOKEN/.test(r.stderr), r.stderr);
 });
 
 test("fetches, echoes verbatim, and writes the config for the collector", async () => {
@@ -47,10 +82,11 @@ test("fetches, echoes verbatim, and writes the config for the collector", async 
   assert.match(r.stdout, /"provider": "github"/);
   assert.match(r.stdout, new RegExp(JOB.id));
   assert.match(r.stdout, /share_private_repo_count: false/);
-  // A provider this collector version cannot run is a warning and a skip, not a
-  // demand for a secret nothing would read.
-  assert.match(r.stdout, /::warning::Config asks for provider 'hackerone'/);
-  assert.match(r.stdout, /Preflight OK — providers to run: github/);
+  // ❗Both providers now run. `hackerone` used to be the example of one this
+  //   collector version could not execute — implementing it is what changed
+  //   this line, and leaving the old assertion would have asserted a skip that
+  //   no longer happens.
+  assert.match(r.stdout, /Preflight OK — providers to run: github, hackerone/);
 
   // The EXACT bytes Ravn sent, on disk for the digest to embed.
   const written = readFileSync(join(cwd, "ravn-collection-config.json"), "utf8");

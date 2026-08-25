@@ -158,3 +158,94 @@ export async function startGitHub({ login = "reporter", id = 4242 } = {}) {
 
   return { ...mock, calls, user };
 }
+
+/**
+ * HackerOne's hacker API, enough of it for a collection to complete.
+ *
+ * ❗The credential is CHECKED, not ignored. The one failure a reporter will
+ * really hit is putting their HackerOne handle where the token identifier goes,
+ * and a mock that accepts anything cannot prove the collector says something
+ * useful when that happens. So: this mock 401s unless the Basic pair matches,
+ * exactly as HackerOne does.
+ */
+export async function startHackerOne({
+  identifier = "ravn-collector-token",
+  token = "h1_fake_token",
+  username = "ave.rez",
+  userId = 88213,
+  reports = null,
+  earnings = null,
+} = {}) {
+  const calls = [];
+  const expected = `Basic ${Buffer.from(`${identifier}:${token}`).toString("base64")}`;
+
+  const reporter = { id: userId, type: "user", attributes: { username } };
+  const report = (over) => ({
+    id: String(over.id),
+    type: "report",
+    attributes: {
+      title: over.title ?? `Finding ${over.id}`,
+      state: over.state ?? "resolved",
+      created_at: over.created_at ?? "2025-06-01T10:00:00.000Z",
+      disclosed_at: over.disclosed_at ?? null,
+      cve_ids: over.cve_ids ?? [],
+    },
+    relationships: {
+      reporter: { data: reporter },
+      program: { data: { id: "1", attributes: { handle: over.program ?? "acme" } } },
+      severity: { data: { id: "1", attributes: { rating: over.severity ?? "high" } } },
+    },
+  });
+
+  const DEFAULT_REPORTS = [
+    report({ id: 2140960, state: "resolved", severity: "critical", program: "xai",
+             disclosed_at: "2025-11-02T00:00:00.000Z", cve_ids: ["CVE-2025-1234"] }),
+    report({ id: 2140961, state: "resolved", severity: "high", program: "acme" }),
+    report({ id: 2140962, state: "triaged", severity: "medium", program: "acme",
+             title: "SSRF in the internal metadata proxy" }),
+    report({ id: 2140963, state: "duplicate", severity: "low", program: "globex" }),
+    // ❗Outside a 5-year window. The lookback is a real boundary, and a fixture
+    //   where everything is in range cannot show that it is applied.
+    report({ id: 2140900, state: "resolved", severity: "high", program: "oldcorp",
+             created_at: "2015-01-01T00:00:00.000Z" }),
+  ];
+
+  const mock = await listen(async (req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    calls.push(`${req.method} ${url.pathname}`);
+    const json = (status, body) => {
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+
+    if (req.headers.authorization !== expected) {
+      return json(401, { errors: [{ title: "Unauthorized" }] });
+    }
+
+    const page = Number(url.searchParams.get("page[number]") ?? 1);
+
+    if (url.pathname === "/v1/hackers/me/reports") {
+      return json(200, { data: page === 1 ? (reports ?? DEFAULT_REPORTS) : [] });
+    }
+    if (url.pathname === "/v1/hackers/payments/earnings") {
+      const data =
+        earnings ??
+        [
+          { id: "1", attributes: { amount: "1500.0", currency: "USD" } },
+          { id: "2", attributes: { amount: "500.5", currency: "USD" } },
+        ];
+      return json(200, { data: page === 1 ? data : [] });
+    }
+    return json(404, { errors: [{ title: "Not found" }] });
+  });
+
+  return {
+    origin: `${mock.origin}/v1`,
+    identifier,
+    token,
+    username,
+    userId,
+    calls,
+    close: mock.close,
+  };
+}

@@ -9,7 +9,7 @@
     },
     {
       "provider": "hackerone",
-      "required": { "secrets": ["H1_TOKEN"] },
+      "required": { "secrets": ["H1_API_IDENTIFIER", "H1_API_TOKEN"] },
       "metadata": {}
     }
   ]
