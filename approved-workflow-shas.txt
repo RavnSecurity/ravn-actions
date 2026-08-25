@@ -11,3 +11,5 @@
 e6d0c5acbc9f7e5aacb907aa073b41aae70c3c18
 # d360e1a6d301470b55eed97354dc8c973fff7dd8 2026-08-22 digest v1: upstream contributions, notability set, assertions (ravn-platform#226)
 d360e1a6d301470b55eed97354dc8c973fff7dd8
+# bedc53a8ab8d86222a74b1716817ad020336cd2e 2026-08-25 OIDC-gated config fetch; job_id + delivered config inside the signed digest; script-pin gap closed (ravn-platform#231, #8)
+bedc53a8ab8d86222a74b1716817ad020336cd2e
