@@ -25,7 +25,7 @@ on:
           mock during development, is a caller-side change and not a new
           collector SHA to approve.
         type: string
-        default: https://api.ravnsecurity.io
+        default: https://apps.ravnsecurity.io/api/reputation
     secrets:
       RAVN_READONLY_TOKEN:
         description: >
