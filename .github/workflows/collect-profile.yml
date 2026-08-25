@@ -37,6 +37,21 @@ on:
           credential variable, and using it would make the reporter's PAT the
           ambient credential for every tool in the job.
         required: false
+      H1_API_IDENTIFIER:
+        description: >
+          The IDENTIFIER of your HackerOne API token — the name shown beside it
+          in your HackerOne settings.
+
+          ❗Not your HackerOne handle. HackerOne's API is HTTP Basic over
+          `identifier:token`, and entering the handle here is the obvious thing
+          to do and fails with a 401 that explains nothing. Both this and the
+          token are required; a token alone cannot authenticate.
+        required: false
+      H1_API_TOKEN:
+        description: >
+          The value of your HackerOne API token. Ravn never sees it — it is read
+          inside your own runner, and only aggregates leave it.
+        required: false
 
 jobs:
   collect:
@@ -247,7 +262,32 @@ jobs:
           # tell the reporter which secret is missing instead of producing a thin
           # digest an hour later. Empty when unset, which is what preflight checks.
           RAVN_READONLY_TOKEN: ${{ secrets.RAVN_READONLY_TOKEN }}
+          # ❗Both, for the same reason. HackerOne's API is Basic over the pair,
+          # so preflight naming only one would pass and then 401 mid-run.
+          H1_API_IDENTIFIER: ${{ secrets.H1_API_IDENTIFIER }}
+          H1_API_TOKEN: ${{ secrets.H1_API_TOKEN }}
         run: node .ravn-actions/scripts/fetch-config.mjs
+
+      # ❗BEFORE the GitHub collector, because `collect.mjs` folds this fragment
+      # into `profile-digest.json` before hashing it. Run it after, and the
+      # HackerOne observations sit in a file beside the digest, outside the
+      # signature — which is to say, not evidence.
+      #
+      # ❗Conditional on the DELIVERED config, not on whether the secret happens
+      # to be set. The reporter decides what is collected when they register the
+      # job; a secret sitting in the repository is not consent to use it.
+      - name: Collect HackerOne (if this config asks for it)
+        env:
+          H1_API_IDENTIFIER: ${{ secrets.H1_API_IDENTIFIER }}
+          H1_API_TOKEN: ${{ secrets.H1_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          config="${RAVN_COLLECTION_CONFIG:-ravn-collection-config.json}"
+          if jq -e '.config.collectors[]? | select(.provider == "hackerone")' "$config" >/dev/null; then
+            node .ravn-actions/scripts/collect-hackerone.mjs
+          else
+            echo "This config asks for no 'hackerone' collector; skipping."
+          fi
 
       - name: Collect + digest
         id: collect
