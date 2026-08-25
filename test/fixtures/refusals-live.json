@@ -1,0 +1,41 @@
+{
+  "_source": {
+    "what": "Verbatim refusal bodies from svc-reputation in PRODUCTION. Captured with curl, not written by hand — the whole point of this file is that it is evidence of the shape the endpoint really sends, not a restatement of what this collector assumes.",
+    "why": "ravn-actions#11: the endpoint emits the refusal deeplink as `help`; the collector read `link ?? url`, so every refusal in prod fell back to the portal root. Both suites passed throughout, because each side tested its own invented fixture. A hand-written fixture here would reintroduce exactly that blind spot.",
+    "endpoint": "POST https://apps.ravnsecurity.io/api/reputation/attestations/config",
+    "service": "svc-reputation (ravn-platform), production, behind the /api/reputation prefix",
+    "capturedFrom": "the ravn-developer devcontainer, over the public internet — no auth, no VPN",
+    "howToRecapture": "Re-run each entry's `request` verbatim and paste the response body into `bodyText` unchanged, then update `capturedAt`. Nothing else in this file is derived.",
+    "doNotEdit": "Never hand-edit `bodyText`. If a body here no longer matches what prod sends, that difference is the finding — recapture, and read the diff before changing any test.",
+    "limits": "Only the two unauthenticated refusal paths and one bad-signature path can be reached without a live Actions OIDC token, so codes like `no-binding`, `repo-mismatch`, `job-locked` and `job-expired` are not captured here. The prod run in ravn-actions#11 (dwelch2344/ravn-attestation-demo run 32803993877) shows `no-binding` taking the same shape. What every captured body shares — and what the collector must honour — is that the deeplink field is named `help`."
+  },
+  "captures": [
+    {
+      "name": "missing-token",
+      "capturedAt": "2026-08-25T03:23:15.000Z",
+      "request": "curl -sS -X POST https://apps.ravnsecurity.io/api/reputation/attestations/config",
+      "status": 401,
+      "statusText": "Unauthorized",
+      "contentType": "application/json; charset=utf-8",
+      "bodyText": "{\"ok\":false,\"code\":\"missing-token\",\"message\":\"No `Authorization: Bearer <oidc-token>` header was presented.\",\"help\":\"https://apps.ravnsecurity.io/docs/collection/refusals#missing-token\"}"
+    },
+    {
+      "name": "invalid-token-malformed",
+      "capturedAt": "2026-08-25T03:23:16.000Z",
+      "request": "curl -sS -X POST https://apps.ravnsecurity.io/api/reputation/attestations/config -H 'Authorization: Bearer not.a.jwt'",
+      "status": 401,
+      "statusText": "Unauthorized",
+      "contentType": "application/json; charset=utf-8",
+      "bodyText": "{\"ok\":false,\"code\":\"invalid-token\",\"message\":\"The `Authorization` header did not carry a readable JWT.\",\"help\":\"https://apps.ravnsecurity.io/docs/collection/refusals#invalid-token-malformed\",\"reason\":\"malformed\"}"
+    },
+    {
+      "name": "invalid-token-signature",
+      "capturedAt": "2026-08-25T03:23:16.000Z",
+      "request": "curl -sS -X POST https://apps.ravnsecurity.io/api/reputation/attestations/config -H 'Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6IngifQ.eyJpc3MiOiJodHRwczovL3Rva2VuLmFjdGlvbnMuZ2l0aHVidXNlcmNvbnRlbnQuY29tIiwiYXVkIjoiaHR0cHM6Ly9yYXZuc2VjdXJpdHkuaW8iLCJzdWIiOiJyZXBvOnJlcG9ydGVyL3Jhdm4tYXR0ZXN0YXRpb25zOnJlZjpyZWZzL2hlYWRzL21haW4iLCJyZXBvc2l0b3J5IjoicmVwb3J0ZXIvcmF2bi1hdHRlc3RhdGlvbnMiLCJleHAiOjF9.c2ln'",
+      "status": 401,
+      "statusText": "Unauthorized",
+      "contentType": "application/json; charset=utf-8",
+      "bodyText": "{\"ok\":false,\"code\":\"invalid-token\",\"message\":\"The token's signature could not be verified against GitHub's published keys.\",\"help\":\"https://apps.ravnsecurity.io/docs/collection/refusals#invalid-token-signature\",\"reason\":\"signature\"}"
+    }
+  ]
+}

@@ -69,8 +69,15 @@ collector now asks Ravn for its config at the start of every run:
    input duplicating what the token already proves.
 2. Ravn answers with `{ job: { id, expiresAt }, config }`, or refuses with a code and a
    deeplink (`no-binding`, `job-locked`, `job-expired`, `repo-mismatch`,
-   `event-not-dispatch`, `invalid-token`). **A refusal stops the run before anything is
-   collected**, printing the code and the page that fixes it.
+   `event-not-dispatch`, `invalid-token`, `missing-token`). **A refusal stops the run
+   before anything is collected**, printing the code and the page that fixes it.
+
+   ❗The deeplink field is **`help`** — that is what svc-reputation sends, and it is now
+   the name to write down. ADR security-005 §4 requires a deeplink but never named the
+   field, so the two halves picked different ones and every refusal in prod dropped its
+   link for weeks with both test suites green (#11). The collector also accepts `link`
+   and `url`, in that order of preference, because widening the reader is the change
+   that does not need a re-approval. It is tolerance, not a second contract.
 3. Required secrets are checked in **preflight**, so a missing one fails naming itself rather
    than turning up as a thin digest an hour later.
 
@@ -250,7 +257,14 @@ PRs: the merge commit on `main`). After a collector change lands:
   token they mint, and they should be able to audit it in two minutes. `npm install` in the
   collector step would also mean the attested SHA no longer pins everything that runs.
 - `scripts/lib/notability.mjs` — loads and hashes the notability set from disk.
-- `test/` — `node --test`, real loopback mocks, no dependencies.
+- `test/` — `node --test`, real loopback mocks, no dependencies. Run it as
+  `node --test test/*.test.mjs`; `node --test test/` sweeps the helper modules in and
+  fails misleadingly.
+- `test/fixtures/refusals-live.json` — refusal bodies **captured verbatim from production**,
+  with the exact request and capture time recorded alongside each one. The tests that read it
+  take the expected deeplink out of the captured body rather than restating it, so a
+  server-side rename fails the build instead of passing unnoticed. Never hand-edit a
+  `bodyText`: a fixture we wrote ourselves is what let #11 through.
 - `scripts/get-ravn-profile.sh` — reporter onboarding (curl | bash).
 - `notability/notable-projects.txt` — the published notability set. Governed like the SHA list.
 - `verification/verify.sh` — third-party bundle verifier.

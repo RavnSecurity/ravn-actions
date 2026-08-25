@@ -132,7 +132,16 @@ async function fetchConfig(token) {
         status: res.status,
         code: err?.code,
         message: err?.message,
-        link: err?.link ?? err?.url,
+        // ❗`help` FIRST, and it is the one prod actually sends (#11). ADR
+        // security-005 §4 requires the deeplink but never names the field, so
+        // svc-reputation's `refuse()` chose `help` and this side chose `link`
+        // — and every refusal in prod silently fell back to the portal root
+        // while both test suites stayed green. Widened here rather than renamed
+        // server-side: the endpoint's shape is already live, and the collector
+        // is the half that can absorb a change without a re-approval. Tolerate
+        // all three; `test/fetch-config.test.mjs` gates this against captured
+        // production bodies, not against a fixture we wrote to match ourselves.
+        link: err?.help ?? err?.link ?? err?.url,
       })}\n\nNothing was collected.`,
     );
   }
