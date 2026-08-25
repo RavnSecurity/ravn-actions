@@ -26,33 +26,95 @@ Three links, each independently checkable:
    certificate. A composite action would not appear in OIDC claims — the caller could swap
    its body and the provenance would look identical. With a reusable workflow, the signed
    claim says which collector version ran, regardless of anything else in the caller's repo.
-2. **The collector code rides the same SHA as the claim.** The workflow checks out its own
-   scripts at `${{ github.job_workflow_sha }}` — the attested workflow commit — so the code
-   that produced the digest and the version the claim names cannot diverge (the script-pin
-   gap, ravn-platform#133).
+2. **The collector code rides the same SHA as the claim.** Before anything is checked out,
+   the workflow mints an OIDC token, reads the `job_workflow_sha` claim out of its payload,
+   and checks its own scripts out at *that* commit — the attested workflow commit — so the
+   code that produced the digest and the version the claim names cannot diverge (the
+   script-pin gap, ravn-platform#133). It then asserts the checked-out `HEAD` is that commit
+   and prints both, because "checkout quietly resolved the ref to something else" is the
+   precise failure this link is here to prevent.
+
+   ❗**This did not hold before [#8](https://github.com/RavnSecurity/ravn-actions/issues/8),
+   and every collector SHA approved before it is affected.** The step read
+   `${{ github.job_workflow_sha }}`, and that context value is *empty* inside a reusable
+   workflow — measured, not inferred. `actions/checkout` treats an empty `ref` as "give me
+   the default branch", so the claim named collector SHA *X* while the code that ran was
+   whatever `main` held. It failed open and it failed silently: the run went green. The OIDC
+   token is the only place the value is actually populated, which is why it is now read from
+   there, and why an empty, missing or malformed claim **aborts the run** rather than falling
+   through to a branch.
+
+   The token is decoded, not signature-verified, and that is deliberate: GitHub minted it for
+   this job seconds earlier, and Ravn re-verifies the same claim server-side on ingest — so a
+   tampered value is refused there rather than yielding a trusted digest.
 3. **Approved versions are published.** [`approved-workflow-shas.txt`](approved-workflow-shas.txt)
    lists every collector commit Ravn trusts (append-only, `#` comments, revocation lane TBD
    ravn-platform#137). Verifiers check the certificate's Build Signer Digest
    (`job_workflow_sha`) against it. Ravn's control plane re-runs the whole verification
    server-side on upload.
 
-## Generating a profile
+The same OIDC token is what authenticates the config fetch below. That is why the fetch is a
+step in **this** workflow and not in the caller's: a fetch in the caller's workflow presents a
+token naming the caller's own file, which is self-referential and proves nothing (ADR
+security-005 D13).
+
+## Where the config comes from
+
+`ravn.config.yml` in the reporter's repository is **retired** (ADR security-005 §4). The
+collector now asks Ravn for its config at the start of every run:
+
+1. It mints a GitHub OIDC token with Ravn's audience (`https://ravnsecurity.io`) and POSTs it
+   to `<ravn-base-url>/attestations/config`. There is no request body — owner, repo, actor,
+   event and runner all arrive in the verified claims, and a body would be unauthenticated
+   input duplicating what the token already proves.
+2. Ravn answers with `{ job: { id, expiresAt }, config }`, or refuses with a code and a
+   deeplink (`no-binding`, `job-locked`, `job-expired`, `repo-mismatch`,
+   `event-not-dispatch`, `invalid-token`). **A refusal stops the run before anything is
+   collected**, printing the code and the page that fixes it.
+3. Required secrets are checked in **preflight**, so a missing one fails naming itself rather
+   than turning up as a thin digest an hour later.
+
+❗**The token is a channel credential, not an identity.** It proves which repository, workflow
+and commit are executing. Who the reporter *is* still comes from the account behind
+`RAVN_READONLY_TOKEN` — the PAT they mint, that Ravn never holds.
+
+❗**You still see what you agreed to share, and so does a triager.** Server-delivered config
+would otherwise move "what you share" from the reporter to Ravn's server. Two things prevent
+that, and neither is optional (D12): the config is **printed verbatim to the run log before
+anything is collected**, while the run can still be cancelled; and it is **embedded in
+`profile-digest.json` before the file is hashed**, so it is covered by the signature.
+
+### Generating a profile
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/RavnSecurity/ravn-actions/main/scripts/get-ravn-profile.sh | bash
 ```
 
-Requires `git`, `jq`, and an authenticated `gh`. The script creates your own copy of
-[`RavnSecurity/ravn-profile-template`](https://github.com/RavnSecurity/ravn-profile-template),
-walks you through sharing preferences (`ravn.config.yml` — conservative defaults; only
-aggregates ever leave the runner), runs the collector, downloads the digest, verifies the
-signature, and assembles `ravn-profile-bundle.json`. Upload that bundle in the Ravn portal at
-**https://apps.ravnsecurity.io/app/profile**.
+❗This onboarding script still drives the **`ravn-profile-template` + `ravn.config.yml`** flow,
+which security-005 retires in favour of a job created in the Ravn portal and dispatched from
+`ravn-attestations`. It works against the collector SHAs approved before this change; it is not
+the entry point for the OIDC flow described above. Replacing it is separate work.
 
 ## What gets collected (`ravn.profile-digest/v1`)
 
 The digest carries `observations` — individually typed facts — alongside the `signals` object v0
 emitted, which is still produced so anything reading the old shape keeps working.
+
+Two fields ride at the top level, and both are written **before the file is hashed** — which is
+the only placement worth anything, since `attest-build-provenance` signs the SHA-256 of
+`profile-digest.json` and anything beside that file is strippable:
+
+- `collection_config` — the config Ravn delivered, verbatim, alongside the `redaction` object
+  holding the sharing preferences this collector version actually resolved from it. What Ravn
+  asked for and what the collector did with it are different questions, so they are different
+  fields.
+- `job_id` — the collection job this run was issued (D7). Bundles are bearer artifacts: a
+  genuine, untampered digest belonging to Alice verifies perfectly when uploaded by Bob. The
+  job id is the nonce that keeps "which job produced this?" answerable, and it is stamped from
+  day one because provenance cannot be backfilled.
+
+The schema stays `v1`: both are additive optional fields, and the extractor ignores keys it
+does not know.
 
 **The strongest thing in it is upstream contribution.** `github.upstream_contribution` records
 merged pull requests into projects on Ravn's published notability list. That observation is
@@ -81,7 +143,7 @@ point — the file decides what "well-known" means.
 ### Pointing at what the list misses
 
 Absence from the notability list is not a judgement about a project; it means Ravn has not
-curated it. Two `ravn.config.yml` keys let a reporter say so:
+curated it. Two keys in the GitHub collector's `metadata` let a reporter say so:
 
 - `nominate_repos:` — repositories to collect merged-PR counts for. Emitted with
   `notable: false, nominated: true`, and Ravn claims them separately and at lower weight.
@@ -107,9 +169,10 @@ integration backlog, ranked by real behaviour rather than by guesswork.
 
 `digest` is a STRING, not nested JSON, so a verifier can hash the exact attested bytes before
 parsing anything — re-serialized JSON would not hash identically. Inside is a
-`ravn.profile-digest/v1` document (`subject.github_login`/`github_id`/`external_id`,
-`generated_at`, the redaction config, the notability set id and hash, `observations`,
-`assertions`, and the v0 `signals` object). `attestation` is the Sigstore bundle object exactly
+`ravn.profile-digest/v1` document (`job_id`, `subject.github_login`/`github_id`/`external_id`,
+`generated_at`, `collection_config` and the resolved redaction config, the notability set id
+and hash, `observations`, `assertions`, and the v0 `signals` object). `attestation` is the
+Sigstore bundle object exactly
 as `gh attestation download` / `GET /repos/{o}/{r}/attestations/sha256:<digest>` returns it.
 
 The envelope is unchanged at v1 — a verifier hashes bytes and checks a signature, and neither
@@ -130,23 +193,38 @@ Signer Digest against the approved list (fetched from raw `main`, overridable vi
 authenticated `gh` >= 2.49. Without `gh`, the same bundle verifies with cosign — the exact
 commands are in the header of [`verification/verify.sh`](verification/verify.sh).
 
-## ❗Before digest v1 can run
+## ❗Every change to `collect-profile.yml` un-approves the collector
 
-The collector in this repo now emits `ravn.profile-digest/v1`, but
-`ravn-profile-template` is still pinned to the **v0** collector SHA
-(`e6d0c5acbc9f7e5aacb907aa073b41aae70c3c18`). Until both steps below are done,
-reporters keep generating v0 digests — which still verify and still ingest, but
-carry no upstream contributions, which is the whole point of v1.
+The SHA is the identity. Changing this workflow changes the SHA in the signing certificate, so
+until the new one is approved AND the caller is pinned to it, nothing has shipped:
 
 1. Land the collector change on `main`, then append that commit SHA to
-   `approved-workflow-shas.txt`.
-2. Bump the `uses:` pin in
-   `ravn-profile-template/.github/workflows/generate-ravn-profile.yml` to the
-   same commit.
+   `approved-workflow-shas.txt` (RavnSecurity/ravn-actions#6).
+2. Bump the `uses:` pin in the caller — `ravn-attestations`
+   (RavnSecurity/ravn-attestations#1), and `ravn-profile-template` while it is still the
+   template flow — to the same commit.
 
-Both are required. Approving the SHA without bumping the pin changes nothing;
-bumping the pin without approving the SHA makes every submission fail closed as
-`workflow-not-approved`.
+Both are required. Approving the SHA without bumping the pin changes nothing; bumping the pin
+without approving the SHA makes every submission fail closed as `workflow-not-approved`.
+
+❗The OIDC config change also alters the collector's **inputs**: `config-path` is gone and
+`ravn-base-url` is new. A caller that still passes `config-path` fails at dispatch with
+"Invalid input", so the pin bump and the `with:` block have to move together.
+
+## Tests
+
+```sh
+node --test test/*.test.mjs
+```
+
+Node's own test runner against real loopback servers standing in for Ravn and for GitHub — no
+dependencies, nothing to install, consistent with the collector itself shipping none. The
+collector scripts run as child processes, which is how a runner runs them and the only way to
+assert on what they print and write.
+
+`test/collect.test.mjs` carries the proof that matters: it hashes `profile-digest.json` exactly
+as the workflow attests it, then shows the hash moves when `job_id` or `collection_config` is
+removed. A field whose removal does not change the hash was never covered by it.
 
 ## Approving a new collector version (maintainers)
 
@@ -162,12 +240,17 @@ PRs: the merge commit on `main`). After a collector change lands:
 
 - `.github/workflows/collect-profile.yml` — the reusable collector workflow (the attested
   identity).
+- `scripts/fetch-config.mjs` — preflight: mints the OIDC token, fetches the config, prints it,
+  checks required secrets. ❗Lives here, not in the caller's workflow (D13).
 - `scripts/collect.mjs` — the collection script; config-driven redaction, aggregates only.
-- `scripts/lib/config.mjs` — a small, dependency-free YAML subset parser. Deliberately not a
-  library: this runs in the reporter's environment against a token they mint, and they should be
-  able to audit it in two minutes. `npm install` in the collector step would also mean the
-  attested SHA no longer pins everything that runs.
+- `scripts/lib/collection.mjs` — the runner's side of `ravn.collection-config/v1`: the provider
+  registry, the refusal table, preflight.
+- `scripts/lib/config.mjs` — sharing preferences and their conservative defaults. ❗Deliberately
+  dependency-free, like everything else here: this runs in the reporter's environment against a
+  token they mint, and they should be able to audit it in two minutes. `npm install` in the
+  collector step would also mean the attested SHA no longer pins everything that runs.
 - `scripts/lib/notability.mjs` — loads and hashes the notability set from disk.
+- `test/` — `node --test`, real loopback mocks, no dependencies.
 - `scripts/get-ravn-profile.sh` — reporter onboarding (curl | bash).
 - `notability/notable-projects.txt` — the published notability set. Governed like the SHA list.
 - `verification/verify.sh` — third-party bundle verifier.

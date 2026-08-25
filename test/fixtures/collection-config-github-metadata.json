@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "type": "profile",
+  "collectors": [
+    {
+      "provider": "github",
+      "required": { "secrets": ["RAVN_READONLY_TOKEN"] },
+      "metadata": {
+        "share_org_memberships": true,
+        "share_public_repo_names": true,
+        "lookback_years": 2,
+        "nominate_repos": ["someone/not-on-the-list"],
+        "assertions": [
+          { "kind": "cve", "pointer": "https://nvd.nist.gov/vuln/detail/CVE-2026-0001", "label": "CVE credit" }
+        ],
+        "share_wishful_thinking": true
+      }
+    }
+  ]
+}

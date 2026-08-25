@@ -29,26 +29,65 @@
  * same commit and is therefore covered by the same attestation. The reporter may
  * nominate additional repositories, and those are marked as their assertion —
  * never as a notable-project claim.
+ *
+ * ── Where the config comes from, since security-005 ────────────────────────
+ *
+ * `ravn.config.yml` in the reporter's repo is retired. The config is fetched by
+ * `scripts/fetch-config.mjs` over an OIDC-authenticated channel and left on disk
+ * for this script to read.
+ *
+ * ❗Two things then have to be true, or server-delivered config quietly moves
+ * "what you share" from the reporter to Ravn's server (D12):
+ *
+ *   - the fetch step PRINTS the config before anything is collected, and
+ *   - this script embeds it in the digest BEFORE hashing.
+ *
+ * The second is what keeps security-004's promise — that a triager verifying a
+ * bundle can see what was withheld — true. Config outside the hashed bytes is
+ * config anyone can substitute after the fact.
  */
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { collectorFor } from "./lib/collection.mjs";
 import { resolveConfig } from "./lib/config.mjs";
 import { isNotable, loadNotabilitySet } from "./lib/notability.mjs";
 
 const TOKEN = process.env.RAVN_TOKEN;
 const ACTOR = process.env.RAVN_ACTOR;
-const CONFIG_PATH = process.env.RAVN_CONFIG_PATH || "ravn.config.yml";
+const CONFIG_PATH = process.env.RAVN_COLLECTION_CONFIG || "ravn-collection-config.json";
 
 if (!TOKEN) {
   console.error("No token available; aborting.");
   process.exit(1);
 }
 
-const configText = existsSync(CONFIG_PATH) ? readFileSync(CONFIG_PATH, "utf8") : "";
-const { cfg, unknown } = resolveConfig(configText);
+// ❗Fail if the fetch step did not run. There is no "collect with defaults"
+// fallback on purpose: a run that collects against a config nobody delivered
+// produces a digest whose `collection_config` is a fiction, and D7's job id
+// would be absent from a bundle that otherwise looks complete.
+if (!existsSync(CONFIG_PATH)) {
+  console.error(
+    `No collection config at ${CONFIG_PATH}. This script runs after scripts/fetch-config.mjs, ` +
+      "which fetches the config over OIDC and writes it there; aborting.",
+  );
+  process.exit(1);
+}
+
+const response = JSON.parse(readFileSync(CONFIG_PATH, "utf8"));
+const collectionConfig = response.config;
+const JOB_ID = response.job?.id ?? null;
+const githubCollector = collectorFor(collectionConfig, "github");
+if (!githubCollector) {
+  console.error("The delivered config has no 'github' collector; aborting.");
+  process.exit(1);
+}
+// Per-provider `metadata` is where the reporter's sharing preferences live.
+const { cfg, unknown } = resolveConfig(githubCollector.metadata);
 
 // ---------- GitHub API helpers ----------
-const API = "https://api.github.com";
+// The base is overridable so the collector can be exercised end to end against
+// a mock; in a real run nothing sets it and it is api.github.com.
+const API = process.env.RAVN_GITHUB_API || "https://api.github.com";
 const headers = {
   Authorization: `Bearer ${TOKEN}`,
   Accept: "application/vnd.github+json",
@@ -78,11 +117,23 @@ async function main() {
   const login = user.login;
   const notability = loadNotabilitySet();
   const warnings = [];
-  if (unknown.length) warnings.push(`unknown config keys ignored: ${unknown.join(", ")}`);
+  if (unknown.length) {
+    warnings.push(
+      `config keys this collector version does not know, ignored: ${unknown.join(", ")}`,
+    );
+  }
   if (notability.missing) warnings.push("notability list not found; upstream matching skipped");
 
   const digest = {
     schema: "ravn.profile-digest/v1",
+    // ❗D7 — the job id is a TOP-LEVEL digest field, written before the file is
+    // hashed and therefore covered by the signature. It is the nonce: bundles
+    // are bearer artifacts, and a genuine untampered digest belonging to Alice
+    // verifies perfectly when uploaded by Bob. Carrying it in the envelope or an
+    // artifact sidecar instead would make it strippable, and D7 would buy
+    // nothing. Stamped from day one even though enforcement is deferred —
+    // provenance cannot be backfilled.
+    job_id: JOB_ID,
     subject: {
       source: "github",
       github_login: login,
@@ -93,8 +144,16 @@ async function main() {
       external_id: user.id,
     },
     generated_at: new Date().toISOString(),
-    // The sharing config travels INSIDE the signed digest, so a triager sees
-    // what was withheld. What was withheld is itself signal.
+    // ❗D12 — the config Ravn delivered, verbatim, inside the hashed bytes. The
+    // reporter no longer holds a file they can point at, so this IS the record
+    // of what they agreed to: printed to the run log before collection, signed
+    // here, and readable by anyone verifying the bundle.
+    collection_config: collectionConfig,
+    // The RESOLVED sharing preferences — the delivered metadata merged over this
+    // collector version's defaults. Kept distinct from `collection_config`
+    // because they answer different questions: what Ravn asked for, versus what
+    // this collector version actually did with it. An absent key resolves to the
+    // conservative default, and the difference is visible only here.
     redaction: cfg,
     notability: { set: notability.id, sha256: notability.sha256 },
     observations: [],
@@ -286,7 +345,8 @@ async function main() {
   writeFileSync("profile-summary.md", summarize(digest));
   console.log(
     `Digest v1 written: ${digest.observations.length} observations, ` +
-      `${digest.assertions.length} assertions, notability set ${notability.id}.`,
+      `${digest.assertions.length} assertions, notability set ${notability.id}, ` +
+      `job ${JOB_ID ?? "(none)"}.`,
   );
   for (const w of warnings) console.log(`  note: ${w}`);
 }
@@ -384,6 +444,7 @@ function summarize(d) {
     ``,
     `Generated: ${d.generated_at}`,
     `Schema: ${d.schema} · notability set: ${d.notability.set}`,
+    ...(d.job_id ? [`Collection job: ${d.job_id}`] : []),
     ``,
   ];
 
