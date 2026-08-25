@@ -26,10 +26,27 @@ Three links, each independently checkable:
    certificate. A composite action would not appear in OIDC claims — the caller could swap
    its body and the provenance would look identical. With a reusable workflow, the signed
    claim says which collector version ran, regardless of anything else in the caller's repo.
-2. **The collector code rides the same SHA as the claim.** The workflow checks out its own
-   scripts at `${{ github.job_workflow_sha }}` — the attested workflow commit — so the code
-   that produced the digest and the version the claim names cannot diverge (the script-pin
-   gap, ravn-platform#133).
+2. **The collector code rides the same SHA as the claim.** Before anything is checked out,
+   the workflow mints an OIDC token, reads the `job_workflow_sha` claim out of its payload,
+   and checks its own scripts out at *that* commit — the attested workflow commit — so the
+   code that produced the digest and the version the claim names cannot diverge (the
+   script-pin gap, ravn-platform#133). It then asserts the checked-out `HEAD` is that commit
+   and prints both, because "checkout quietly resolved the ref to something else" is the
+   precise failure this link is here to prevent.
+
+   ❗**This did not hold before [#8](https://github.com/RavnSecurity/ravn-actions/issues/8),
+   and every collector SHA approved before it is affected.** The step read
+   `${{ github.job_workflow_sha }}`, and that context value is *empty* inside a reusable
+   workflow — measured, not inferred. `actions/checkout` treats an empty `ref` as "give me
+   the default branch", so the claim named collector SHA *X* while the code that ran was
+   whatever `main` held. It failed open and it failed silently: the run went green. The OIDC
+   token is the only place the value is actually populated, which is why it is now read from
+   there, and why an empty, missing or malformed claim **aborts the run** rather than falling
+   through to a branch.
+
+   The token is decoded, not signature-verified, and that is deliberate: GitHub minted it for
+   this job seconds earlier, and Ravn re-verifies the same claim server-side on ingest — so a
+   tampered value is refused there rather than yielding a trusted digest.
 3. **Approved versions are published.** [`approved-workflow-shas.txt`](approved-workflow-shas.txt)
    lists every collector commit Ravn trusts (append-only, `#` comments, revocation lane TBD
    ravn-platform#137). Verifiers check the certificate's Build Signer Digest
