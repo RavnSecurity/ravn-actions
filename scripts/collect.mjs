@@ -156,6 +156,18 @@ async function main() {
     // conservative default, and the difference is visible only here.
     redaction: cfg,
     notability: { set: notability.id, sha256: notability.sha256 },
+    /**
+     * Every account this run actually observed, `subject` included.
+     *
+     * ❗`subject` stays exactly what it was — the GitHub account the OIDC
+     * identity and the collection job belong to. It is NOT a list, and widening
+     * it would change what the job binds to. This is the additive answer to a
+     * different question: "whose facts are in here", which used to have only one
+     * possible answer and now does not.
+     */
+    collected_from: [
+      { source: "github", external_id: user.id, handle: login, schema: "ravn.profile-digest/v1" },
+    ],
     observations: [],
     assertions: [],
     // v0's shape, still emitted so anything reading the old format keeps working.
@@ -341,6 +353,36 @@ async function main() {
     });
   }
 
+  /*
+   * ── fold in any other collector's fragment ──────────────────────────────
+   *
+   * ❗ONE digest, one signature, one job. The HackerOne collector runs before
+   * this script and leaves `hackerone-digest.json`; folding it in HERE, before
+   * the file is written, is what puts it inside the bytes that get hashed and
+   * attested. Anything carried beside `profile-digest.json` is not signed, and
+   * an unsigned fragment is not evidence.
+   *
+   * ❗Its observations already name their own account. They are appended
+   * verbatim — this file does not re-attribute them, does not merge them into a
+   * GitHub section, and does not interpret them. Ravn records each against the
+   * account the observation names.
+   */
+  for (const fragment of readFragments(warnings)) {
+    digest.observations.push(...fragment.observations);
+    digest.collected_from.push({
+      source: fragment.account.source,
+      external_id: fragment.account.external_id,
+      handle: fragment.account.handle ?? null,
+      schema: fragment.schema,
+      generated_at: fragment.generated_at,
+      // The other collector's preferences, carried so a triager verifying this
+      // bundle sees what THAT collector was allowed to look at too.
+      redaction: fragment.redaction ?? null,
+      observations: fragment.observations.length,
+    });
+    for (const w of fragment.warnings ?? []) warnings.push(`${fragment.account.source}: ${w}`);
+  }
+
   writeFileSync("profile-digest.json", JSON.stringify(digest, null, 2));
   writeFileSync("profile-summary.md", summarize(digest));
   console.log(
@@ -348,6 +390,11 @@ async function main() {
       `${digest.assertions.length} assertions, notability set ${notability.id}, ` +
       `job ${JOB_ID ?? "(none)"}.`,
   );
+  if (digest.collected_from.length > 1) {
+    console.log(
+      `  accounts: ${digest.collected_from.map((a) => `${a.source}:${a.handle ?? a.external_id}`).join(", ")}`,
+    );
+  }
   for (const w of warnings) console.log(`  note: ${w}`);
 }
 
@@ -505,3 +552,29 @@ main().catch((e) => {
   console.error(e);
   process.exit(1);
 });
+
+/**
+ * Fragments written by the other collectors in this run.
+ *
+ * ❗Absent is NORMAL, not an error: a config that asks only for `github` leaves
+ * no fragment, and that is the overwhelmingly common case. A fragment that is
+ * present but unreadable IS worth saying out loud — it means a collector ran,
+ * believed it produced something, and its output is being dropped.
+ */
+function readFragments(warnings) {
+  const out = [];
+  for (const path of ["hackerone-digest.json"]) {
+    if (!existsSync(path)) continue;
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8"));
+      if (!parsed?.account?.source || !Array.isArray(parsed.observations)) {
+        warnings.push(`${path} is not a recognisable collector fragment; ignored`);
+        continue;
+      }
+      out.push(parsed);
+    } catch (err) {
+      warnings.push(`${path} could not be read (${err.message}); ignored`);
+    }
+  }
+  return out;
+}

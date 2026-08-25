@@ -134,6 +134,61 @@ repositories you own or are a member of; the strongest available signal was miss
 weak. v1 uses `contributionsCollection`, which is the API that makes contributions to other
 people's projects visible.
 
+### HackerOne: what you have FOUND
+
+The GitHub collector answers "what has this person built". The HackerOne collector answers
+"what has this person **found**", which is the question a PSIRT team is actually asking when a
+report lands. They are different signals and neither substitutes for the other.
+
+It runs in the same job, before the GitHub collector, and writes `hackerone-digest.json` — a
+fragment `collect.mjs` folds into `profile-digest.json` **before hashing**. One run, one
+signature, one job: a second bundle would mean a second collection job, a second attestation
+and a second upload for what is one act.
+
+**Two secrets, and the first one is a trap.** HackerOne's API is HTTP Basic over
+`identifier:token`, where the identifier is the API token's **name** — not your HackerOne
+handle. Entering the handle is the obvious thing to do and returns a 401 that explains nothing,
+so the collector says so explicitly when it sees one.
+
+| secret | what it is |
+| --- | --- |
+| `H1_API_IDENTIFIER` | the **name** shown beside your API token in HackerOne settings |
+| `H1_API_TOKEN` | the token value |
+
+Neither ever reaches Ravn. Both are read inside your own runner.
+
+**Identity comes from the API, never from the credential.** Because the identifier is an
+arbitrary label you chose, it cannot name anybody — so the collector reads the authenticated
+account from the `reporter` relationship on your own reports (there is no documented
+`/hackers/me` on the hacker API). A hacker with no reports cannot be identified this way, and
+the collector **refuses** rather than falling back to a handle you typed. Refusing is the
+feature: a self-declared handle is the exact thing this design exists not to trust.
+
+What is collected, all of it opt-out-able and two of them opt-in only:
+
+| preference | default | what leaves the runner |
+| --- | --- | --- |
+| `share_report_counts` | on | totals and counts by state. No titles, no targets, no bodies |
+| `share_programs` | on | program handles you have reported to, with counts |
+| `share_severity_breakdown` | on | how many reports at each rating |
+| `share_disclosed_reports` | on | reports HackerOne has **already published** |
+| `share_cve_credits` | on | CVE ids credited to your reports |
+| `share_report_titles` | **off** | titles of reports that are NOT disclosed |
+| `share_bounty_totals` | **off** | one aggregate figure — never per-program |
+
+The two `off` defaults are the ones that matter. The title of an undisclosed report can
+describe a live, unfixed vulnerability in somebody else's product; that is not yours to share
+by default, and a checkbox pre-ticked on your behalf is not consent.
+
+The two strongest are `share_disclosed_reports` and `share_cve_credits`, for the same reason
+upstream contribution is strongest on the GitHub side: **the underlying facts are already
+public**, so Ravn can confirm them without trusting the digest at all.
+
+Every HackerOne observation names its own account, and Ravn records it against **that** account
+rather than against the GitHub identity the run's OIDC token belongs to. Attributing it to the
+GitHub account would put "resolved 40 reports on HackerOne" on a GitHub profile — wrong on its
+face, and wrong in a way that survives every later merge.
+
 ### Notability is not the reporter's call
 
 [`notability/notable-projects.txt`](notability/notable-projects.txt) decides what counts as a

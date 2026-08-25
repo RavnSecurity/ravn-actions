@@ -13,6 +13,8 @@
  * reads, not a guess the runner makes on their behalf.
  */
 
+import { existsSync, readFileSync } from "node:fs";
+
 /** The schema this runner speaks. Carried alongside the document, never inside. */
 export const COLLECTION_CONFIG_SCHEMA = "ravn.collection-config/v1";
 export const COLLECTION_CONFIG_VERSION = 1;
@@ -31,6 +33,14 @@ export const COLLECTION_CONFIG_VERSION = 1;
  */
 export const IMPLEMENTED_PROVIDERS = {
   github: { secrets: ["RAVN_READONLY_TOKEN"] },
+  /**
+   * ❗TWO secrets, not one. HackerOne's API is HTTP Basic over
+   * `identifier:token`, so a token on its own cannot authenticate — and the
+   * identifier is the API token's NAME, not the reporter's HackerOne handle.
+   * Naming only the token here would pass preflight and then 401 in the middle
+   * of the run, which is the precise failure this registry exists to prevent.
+   */
+  hackerone: { secrets: ["H1_API_IDENTIFIER", "H1_API_TOKEN"] },
 };
 
 /**
@@ -143,4 +153,26 @@ export function preflight(config, env = process.env) {
     }
   }
   return { missing, unsupported, runnable };
+}
+
+/**
+ * The config `fetch-config.mjs` wrote, as the collectors read it.
+ *
+ * ❗One reader, because there are now two collectors. This was inline in
+ * `collect.mjs`; a second copy in the HackerOne collector would be a second
+ * place for the env-var name and the "run fetch-config first" message to drift,
+ * and the drift would only show up as a confusing failure inside someone else's
+ * Actions run.
+ */
+export function readDeliveredConfig() {
+  const path = process.env.RAVN_COLLECTION_CONFIG || "ravn-collection-config.json";
+  if (!existsSync(path)) {
+    console.error(
+      `::error::No collection config at ${path}. This script runs after ` +
+        "scripts/fetch-config.mjs, which fetches the config over OIDC and writes it there.",
+    );
+    process.exit(1);
+  }
+  const response = JSON.parse(readFileSync(path, "utf8"));
+  return { response, config: response.config, jobId: response.job?.id ?? null };
 }
