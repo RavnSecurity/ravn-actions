@@ -15,3 +15,5 @@ d360e1a6d301470b55eed97354dc8c973fff7dd8
 bedc53a8ab8d86222a74b1716817ad020336cd2e
 # adac9b69a23a82f838f46622401ff2c6e8641aab 2026-08-25 refusal deeplinks: read `help`, the field the endpoint actually sends (#11)
 adac9b69a23a82f838f46622401ff2c6e8641aab
+# 356d5504acf8457af81964318a1a289b1288d8f3 2026-08-25 HackerOne collector: a second source in the same signed run (#14, ravn-platform#264)
+356d5504acf8457af81964318a1a289b1288d8f3
