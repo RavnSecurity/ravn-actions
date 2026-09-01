@@ -93,14 +93,20 @@ anything is collected**, while the run can still be cancelled; and it is **embed
 
 ### Generating a profile
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/RavnSecurity/ravn-actions/main/scripts/get-ravn-profile.sh | bash
-```
+**Start in the Ravn portal**, at [`/app/profile`](https://apps.ravnsecurity.io/app/profile).
+Connect a source, and it hands you a `curl … | bash` generated for that collection — one that
+creates the repository if you do not have one, sets the secrets it actually needs, commits this
+collector pinned at an approved SHA, and offers to start the run.
 
-❗This onboarding script still drives the **`ravn-profile-template` + `ravn.config.yml`** flow,
-which security-005 retires in favour of a job created in the Ravn portal and dispatched from
-`ravn-attestations`. It works against the collector SHAs approved before this change; it is not
-the entry point for the OIDC flow described above. Replacing it is separate work.
+❗**`scripts/get-ravn-profile.sh` no longer collects anything.** It drove the
+`ravn-profile-template` + `ravn.config.yml` flow that security-005 §4 retires, and under the OIDC
+flow described above a run it started would be refused `no-binding` before collecting a thing —
+because a collection now exists only once a reporter has registered one. The script is kept as a
+one-screen redirect rather than deleted: the URL is in blog posts and bookmarks nobody can edit,
+and a 404 reads as "Ravn is broken" where a sentence reads as "it moved".
+
+❗A script that runs, goes green, and produces a guaranteed refusal is worse than one that is
+gone. It spends the reporter's time and then blames the platform.
 
 ## What gets collected (`ravn.profile-digest/v1`)
 
@@ -320,7 +326,7 @@ PRs: the merge commit on `main`). After a collector change lands:
   take the expected deeplink out of the captured body rather than restating it, so a
   server-side rename fails the build instead of passing unnoticed. Never hand-edit a
   `bodyText`: a fixture we wrote ourselves is what let #11 through.
-- `scripts/get-ravn-profile.sh` — reporter onboarding (curl | bash).
+- `scripts/get-ravn-profile.sh` — ❗RETIRED. A redirect to the portal; it collects nothing.
 - `notability/notable-projects.txt` — the published notability set. Governed like the SHA list.
 - `verification/verify.sh` — third-party bundle verifier.
 - `approved-workflow-shas.txt` — the published trust list.
