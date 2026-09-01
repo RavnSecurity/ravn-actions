@@ -10,14 +10,25 @@
  *
  * ── Two things about the credential, both of which look like bugs ──────────
  *
- * ❗HTTP Basic, and the username is the API TOKEN'S IDENTIFIER — the name given
- * to the token when it was created — not the HackerOne handle. Entering the
- * handle is the obvious thing to do and it fails with a 401 that says nothing
- * about why. `services/adapter-hackerone/src/hackerone.ts` in ravn-platform
- * carries the same note for the program-side API; this is the same trap.
+ * ❗HTTP Basic, and on THIS API the username is the reporter's HackerOne
+ * USERNAME — the handle they log in with — paired with an API token from
+ * hackerone.com/settings/api_token/edit.
  *
- * ❗Therefore the identifier CANNOT tell us who the reporter is. It is an
- * arbitrary label. Identity is read from what the API returns about the
+ * ❗THIS FILE SAID THE OPPOSITE, and the opposite is true one API over.
+ * HackerOne has two: the CUSTOMER/program API authenticates as
+ * `token-name:token`, which is what `services/adapter-hackerone` uses and where
+ * "not your handle" is exactly right — and the HACKER API, used here
+ * (`/hackers/me/reports`), which authenticates as `username:token`. The note was
+ * borrowed from the program side, so this told every reporter to enter the one
+ * value guaranteed to 401, in the very message explaining their 401.
+ *
+ * ❗The env var is still `H1_API_IDENTIFIER`. Renaming it would invalidate every
+ * approved collector SHA and change the config schema and both provider
+ * registries, so the name stays and the prose carries the truth.
+ *
+ * ❗Identity is STILL not taken from the credential, and that does not change
+ * with any of the above. A username is a thing the reporter types, so it proves
+ * nothing on its own. Identity is read from what the API returns about the
  * authenticated caller — see `identityFrom` — and never from the credential,
  * never from config, never from anything the reporter typed. That is the same
  * rule the digest's subject hash follows in ravn-platform, and for the same
@@ -126,9 +137,12 @@ export function authHeader(identifier, token) {
  * One page of a paginated collection.
  *
  * ❗401 is called out by name. It is overwhelmingly the failure a reporter will
- * hit, and overwhelmingly for one reason — they put their HackerOne username in
- * where the token identifier goes. A generic "request failed" here costs them an
- * afternoon; naming the likely cause costs us three lines.
+ * hit, and a generic "request failed" costs them an afternoon.
+ *
+ * ❗AND THE MESSAGE USED TO NAME THE WRONG CAUSE. It told reporters their username
+ * was the mistake and that the token's identifier was wanted — which is true of
+ * HackerOne's CUSTOMER/program API and false of this one. On the hacker API the
+ * username IS the handle, so the advice guaranteed the very 401 it was explaining.
  */
 export async function getPage(fetchImpl, auth, path, params = {}) {
   const url = new URL(`${API}${path}`);
@@ -140,9 +154,10 @@ export async function getPage(fetchImpl, auth, path, params = {}) {
 
   if (res.status === 401) {
     throw new HackerOneError(
-      "HackerOne rejected the credential (401). The Basic-auth username must be the API " +
-        "token's IDENTIFIER — the name shown next to the token in your HackerOne settings — " +
-        "not your HackerOne handle. That is the usual cause of this.",
+      "HackerOne rejected the credential (401). On the HACKER API the Basic-auth username is " +
+        "your HackerOne USERNAME — the handle you log in with — paired with an API token from " +
+        "hackerone.com/settings/api_token/edit. (The token's NAME is the username on HackerOne's " +
+        "customer/program API, which is a different API from this one.)",
       401,
     );
   }

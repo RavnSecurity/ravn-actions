@@ -16,7 +16,8 @@
  *
  * And one thing that is not a nicety: identity comes from the API's own answer,
  * never from the credential and never from config. The Basic-auth username is
- * the API token's IDENTIFIER — an arbitrary label the reporter chose — so it
+ * the reporter's USERNAME on this API (the token's identifier on the program-side
+ * one, which is a different API) — and a username is a thing they typed, so it
  * cannot name anybody. A collector that trusted it would be trusting a
  * self-declared handle, which is the exact thing this design exists to refuse.
  */
@@ -110,12 +111,24 @@ test("no reports means no identity, and the run REFUSES rather than guessing", a
   assert.match(stderr, /self-declared handle/i);
 });
 
-test("a wrong credential says WHY, because it is always the same why", async () => {
+test("a wrong credential says WHY, and says the RIGHT why", async () => {
   const { code, stderr } = await collect({ env: { H1_API_IDENTIFIER: "ave.rez" } });
   assert.notEqual(code, 0);
   assert.match(stderr, /401/);
-  assert.match(stderr, /IDENTIFIER/);
-  assert.match(stderr, /not your HackerOne handle/i);
+
+  /*
+   * ❗THIS ASSERTED THE WRONG ADVICE AND SO DEFENDED IT. The message used to tell
+   * reporters the username had to be the token's IDENTIFIER and "not your
+   * HackerOne handle" — true of HackerOne's CUSTOMER/program API, false of the
+   * hacker API this collector calls, which is Basic over `username:token`. So
+   * the 401 explanation recommended the one value guaranteed to produce a 401,
+   * and this test held it in place.
+   */
+  assert.match(stderr, /USERNAME/);
+  assert.match(stderr, /handle you log in with/i);
+  assert.doesNotMatch(stderr, /not your HackerOne handle/i);
+  // and it points at where a token is actually issued
+  assert.match(stderr, /settings\/api_token/);
 });
 
 // ── consent ────────────────────────────────────────────────────────────────

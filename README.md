@@ -151,15 +151,34 @@ fragment `collect.mjs` folds into `profile-digest.json` **before hashing**. One 
 signature, one job: a second bundle would mean a second collection job, a second attestation
 and a second upload for what is one act.
 
-**Two secrets, and the first one is a trap.** HackerOne's API is HTTP Basic over
-`identifier:token`, where the identifier is the API token's **name** — not your HackerOne
-handle. Entering the handle is the obvious thing to do and returns a 401 that explains nothing,
-so the collector says so explicitly when it sees one.
+**Two secrets, and the variable name is a trap.** This collector calls HackerOne's **hacker
+API** (`api.hackerone.com/v1/hackers/me/…`), which is HTTP Basic over `username:token` — so
+`H1_API_IDENTIFIER` is your **HackerOne username**, the handle you log in with. Issue or
+re-issue the token at [hackerone.com/settings/api_token/edit](https://hackerone.com/settings/api_token/edit).
+
+❗**This documentation said the opposite until 2026-09-01**, and the opposite is true one API
+over: HackerOne's **customer/program** API is Basic over `token-name:token`, which is what
+`adapter-hackerone` uses in ravn-platform and where "not your handle" is exactly right. That
+note was borrowed onto the hacker-API path, so every reporter was told to enter the one value
+guaranteed to 401 — in the same breath as the explanation of their 401.
+
+❗The variable keeps the name `H1_API_IDENTIFIER`. Renaming it would invalidate every approved
+collector SHA and change the config schema and both provider registries, so the name stays and
+the prose carries the truth.
+
+❗**`collect-profile.yml`'s own `H1_API_IDENTIFIER` description still carries the old, wrong
+sentence, deliberately.** Editing it changes the workflow's SHA, which un-approves the collector
+until the new SHA is appended to `approved-workflow-shas.txt` and every caller pin is bumped —
+and until that happens the collector checks itself out at the OLD attested SHA, so the edit
+would not even take effect. All cost, no benefit. Fix it in the same commit as the next
+legitimate collector change, which goes through that dance anyway. Nothing a reporter reads
+comes from that string: the portal and the setup script are the surfaces they see, and both are
+corrected.
 
 | secret | what it is |
 | --- | --- |
-| `H1_API_IDENTIFIER` | the **name** shown beside your API token in HackerOne settings |
-| `H1_API_TOKEN` | the token value |
+| `H1_API_IDENTIFIER` | your HackerOne **username** — the handle you log in with |
+| `H1_API_TOKEN` | the token value, from hackerone.com/settings/api_token/edit |
 
 Neither ever reaches Ravn. Both are read inside your own runner.
 
