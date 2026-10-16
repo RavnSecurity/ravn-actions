@@ -298,6 +298,63 @@ without approving the SHA makes every submission fail closed as `workflow-not-ap
 `ravn-base-url` is new. A caller that still passes `config-path` fails at dispatch with
 "Invalid input", so the pin bump and the `with:` block have to move together.
 
+## The deploy workflow (`deploy.yml`)
+
+The second reusable workflow here is Ravn's own: `.github/workflows/deploy.yml` is the deploy
+tail of the six repositories that ship images (ADR ops-007 §1–§2, in ravn-ops). It shares
+nothing with the collector but the repository. It lives here because ravn-actions is where
+reusable workflows already live, and because the file holds no secret: the AWS account id is an
+input, the deploy App's credentials are the callers' org secrets, and the lane list is read at
+run time.
+
+**Build once, promote by merge.** A caller runs its own gate, then:
+
+```yaml
+deploy:
+  needs: check
+  uses: RavnSecurity/ravn-actions/.github/workflows/deploy.yml@<tag or sha>
+  permissions: { contents: read, id-token: write }
+  with:
+    images: '[{"name":"svc-greeter"}]'        # monorepo: one entry per product, with dockerfile/target
+    aws_account_id: "<account>"
+  secrets: inherit                            # RAVN_DEPLOY_APP_ID / RAVN_DEPLOY_APP_PRIVATE_KEY
+```
+
+With the lane list from argo-apps `lanes/lanes.yaml` (the copy ravn-ops' `main` apply
+publishes; this workflow never reads ravn-ops), a push to lane *k*'s branch is one of three
+things:
+
+| | what happens |
+| --- | --- |
+| **k = 0** | build `sha-<7>` from HEAD, push to ECR `ravn/<name>`, write lane 0's record |
+| **k ≥ 1, HEAD is a merge whose second parent is on lane k−1's branch** | **promote**: lane k−1's record must equal `HEAD^2`, then it is copied to lane k. No build |
+| **k ≥ 1, anything else** | **hotfix build**, said loudly in the run and the job summary |
+
+The record is `lanes/<env>/<name>.yaml` in argo-apps (`image: {tag: sha-<7>}`), written one
+commit per image through the Contents API as the `ravn-deploy` App, with the message
+`lane <env>: <name> sha-<7> (promoted from <lane> @ <sha>) <run URL>`. Nothing is committed to
+the caller's repository, and the workflow holds `contents: read` there. With prod as the only
+lane, every push to `main` is a build: today's behaviour minus the commit-back.
+
+❗**The rollback guard.** Before writing, the record's current tag is resolved as a commit in
+the caller's repository. If that commit is not an ancestor of the one being deployed, the write
+is refused: that is a re-run of an older run after a newer one landed, or a promotion cut before
+a hotfix was merged back, and either would roll the lane back with a green build. Rolling back
+on purpose is a revert of the record commit in argo-apps.
+
+**Dry runs.** `dry_run: true` decides, builds, and prints the record and commit message it would
+write; nothing is pushed and nothing is written. A test caller with no App installed passes the
+lane list as the `lanes` input (dry runs only; a real run refuses it) and no `aws_account_id`,
+and the build runs with no registry at all. `deploy-selftest.yml` is that caller, on every change
+to the workflow. The promote and hotfix branches need two lanes and the previous lane's record:
+`test/deploy.test.mjs` drives them by running the two marked bash blocks out of the workflow
+file against scratch git repositories and a loopback Contents API, so the tested text is the
+shipped text.
+
+**Pinning.** Callers pin a tag: `deploy-v1` moves with compatible changes, `deploy-v1.<n>.<m>`
+does not. The tags are cut on `main` after merge. ❗Not `v1`: a bare major tag on this
+repository would read as a collector version, and the collector is pinned by SHA for a reason.
+
 ## Tests
 
 ```sh
@@ -327,6 +384,9 @@ PRs: the merge commit on `main`). After a collector change lands:
 
 - `.github/workflows/collect-profile.yml` — the reusable collector workflow (the attested
   identity).
+- `.github/workflows/deploy.yml` — Ravn's reusable deploy workflow: build once, promote by
+  merge, write the lane record (ADR ops-007). `deploy-selftest.yml` dry-runs it;
+  `test/deploy.test.mjs` runs its decision blocks against scratch repos and a loopback API.
 - `scripts/fetch-config.mjs` — preflight: mints the OIDC token, fetches the config, prints it,
   checks required secrets. ❗Lives here, not in the caller's workflow (D13).
 - `scripts/collect.mjs` — the collection script; config-driven redaction, aggregates only.

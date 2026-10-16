@@ -1,0 +1,421 @@
+# Ravn's reusable deploy workflow: build once, promote by merge, and write the
+# lane record. ADR ops-007 §1–§2 (ravn-ops/docs/adr/project/ops-007-environment-lanes.md).
+#
+# A caller (one of the six deploying repos) runs its own gate, then:
+#
+#   deploy:
+#     needs: check
+#     uses: RavnSecurity/ravn-actions/.github/workflows/deploy.yml@<tag or sha>
+#     permissions: { contents: read, id-token: write }
+#     with:
+#       images: '[{"name":"svc-greeter"}]'
+#       aws_account_id: "<account>"
+#     secrets: inherit        # RAVN_DEPLOY_APP_ID / RAVN_DEPLOY_APP_PRIVATE_KEY
+#
+# What it does on a push to lane k's branch, with the lane list read from
+# argo-apps `lanes/lanes.yaml` (the copy ravn-ops' `main` apply publishes;
+# this workflow never reads ravn-ops):
+#
+#   k = 0            build sha-<7> from HEAD, push to ECR, write lane 0's record.
+#   k ≥ 1, HEAD is a merge whose second parent is on lane k−1's branch
+#                    PROMOTE: lane k−1's record must equal HEAD^2; copy it to
+#                    lane k. No build.
+#   k ≥ 1, anything else
+#                    HOTFIX build: build HEAD, write lane k's record, and say so
+#                    loudly in the run.
+#
+# The record is `lanes/<env>/<name>.yaml` in argo-apps (`image: {tag: sha-<7>}`),
+# one commit per image through the Contents API with the `ravn-deploy` App, so
+# the commit is the App's and GitHub signs it. Nothing is committed to the
+# caller's repository: `contents: read` is all this workflow holds there.
+#
+# ❗This repository is PUBLIC. Nothing in this file is a secret, and nothing
+# ever should be: the AWS account id is an input the private callers pass, the
+# App credentials are the callers' org secrets, and the lane list is read at
+# run time.
+#
+# ❗The two bash blocks between the `ravn:lane-decider` and `ravn:lane-recorder`
+# markers are executed VERBATIM by test/deploy.test.mjs, against scratch git
+# repositories and a loopback GitHub API. The tested text and the shipped text
+# are the same text, so the promote and hotfix branches of the logic are
+# exercised on every PR without a lane, an App or a cluster.
+name: deploy
+
+on:
+  workflow_call:
+    inputs:
+      images:
+        description: >
+          JSON array of the images this repository builds:
+          `[{"name": "svc-greeter"}]`, or for a monorepo
+          `[{"name": "system", "dockerfile": "deploy/Dockerfile", "target": "system"}, …]`.
+          `name` is both the ECR repository under `ravn/` and the lane record
+          `lanes/<env>/<name>.yaml`. `dockerfile` defaults to `Dockerfile`,
+          `context` to `.`, `target` to none.
+        type: string
+        required: true
+      aws_account_id:
+        description: >
+          The AWS account holding ECR and the CI role
+          `ravn-github-ci-<repo>`. Required for a real run; a dry run without
+          it builds locally and never touches AWS.
+        type: string
+        default: ""
+      aws_region:
+        type: string
+        default: us-west-2
+      dry_run:
+        description: >
+          Decide, build, and PRINT the record and commit message this run would
+          write. Nothing is pushed to ECR and nothing is written to argo-apps.
+          With the App secrets present the real lane list and records are read;
+          without them `lanes` must be given.
+        type: boolean
+        default: false
+      lanes:
+        description: >
+          Dry runs only. The lane list to use instead of argo-apps' copy, as the
+          YAML of `lanes.yaml` (`lanes: [{env: prod, branch: main}]`). Lets a
+          test caller run the workflow with no App installed. Refused when
+          `dry_run` is false.
+        type: string
+        default: ""
+    secrets:
+      RAVN_DEPLOY_APP_ID:
+        description: The `ravn-deploy` GitHub App id (org secret; ravn-ops#214).
+        required: false
+      RAVN_DEPLOY_APP_PRIVATE_KEY:
+        description: The `ravn-deploy` GitHub App private key (org secret; ravn-ops#214).
+        required: false
+    outputs:
+      mode:
+        description: What this run did — `build`, `promote` or `hotfix`.
+        value: ${{ jobs.deploy.outputs.mode }}
+      env:
+        description: The lane deployed to, e.g. `prod`.
+        value: ${{ jobs.deploy.outputs.env }}
+      tag:
+        description: The image tag recorded, `sha-<7>`.
+        value: ${{ jobs.deploy.outputs.tag }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      mode: ${{ steps.decide.outputs.mode }}
+      env: ${{ steps.decide.outputs.env }}
+      tag: ${{ steps.decide.outputs.tag }}
+    # One deploy per lane branch per repo at a time, in push order. A later
+    # push replaces a queued one; a running one is never cancelled, because a
+    # half-written set of records is worse than a stale one.
+    concurrency:
+      group: ravn-deploy-${{ github.repository }}-${{ github.ref_name }}
+      cancel-in-progress: false
+    env:
+      RECORDS_REPO: RavnSecurity/argo-apps
+      RECORDS_BRANCH: main
+      LANES_PATH: lanes/lanes.yaml
+      ECR_PREFIX: ravn
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      # `secrets` is not readable from a step's `if`, so the fact is lifted here.
+      HAVE_APP: ${{ secrets.RAVN_DEPLOY_APP_ID != '' && secrets.RAVN_DEPLOY_APP_PRIVATE_KEY != '' }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Refuse what cannot work
+        env:
+          LANES_OVERRIDE: ${{ inputs.lanes }}
+          AWS_ACCOUNT_ID: ${{ inputs.aws_account_id }}
+        run: |
+          set -euo pipefail
+          if [ "$DRY_RUN" != "true" ]; then
+            if [ -n "$LANES_OVERRIDE" ]; then
+              echo "::error::'lanes' is a dry-run input. A real run reads the lane list argo-apps holds."
+              exit 1
+            fi
+            if [ "$HAVE_APP" != "true" ]; then
+              echo "::error::RAVN_DEPLOY_APP_ID / RAVN_DEPLOY_APP_PRIVATE_KEY are not set. Pass 'secrets: inherit' from a repository the org secrets are visible to (ravn-ops#214)."
+              exit 1
+            fi
+            if [ -z "$AWS_ACCOUNT_ID" ]; then
+              echo "::error::'aws_account_id' is required for a real run."
+              exit 1
+            fi
+          elif [ "$HAVE_APP" != "true" ] && [ -z "$LANES_OVERRIDE" ]; then
+            echo "::error::A dry run needs either the App secrets (to read the lane list) or the 'lanes' input."
+            exit 1
+          fi
+
+      # Full history: the promote check is git ancestry (HEAD^2 on the previous
+      # lane's branch), and the rollback guard asks whether the record's commit
+      # descends from the one being written.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mint the ravn-deploy App token
+        id: app
+        if: env.HAVE_APP == 'true'
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.RAVN_DEPLOY_APP_ID }}
+          private-key: ${{ secrets.RAVN_DEPLOY_APP_PRIVATE_KEY }}
+          owner: RavnSecurity
+          repositories: argo-apps
+
+      - name: Decide — build, promote or hotfix
+        id: decide
+        env:
+          DEPLOY_TOKEN: ${{ steps.app.outputs.token }}
+          LANES_OVERRIDE: ${{ inputs.lanes }}
+          IMAGES: ${{ inputs.images }}
+          REF_NAME: ${{ github.ref_name }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          # --- ravn:lane-decider:begin ---
+          set -euo pipefail
+
+          die() { echo "::error::$1"; shift; [ "$#" -eq 0 ] || printf '%s\n' "$@"; exit 1; }
+          # api <path> → sets BODY and STATUS (not a subshell: a function run in
+          # $(…) cannot hand the status back)
+          api() {
+            local out
+            out=$(curl -sS --max-time 30 -w '\n%{http_code}' \
+              -H "Authorization: Bearer $DEPLOY_TOKEN" -H "Accept: application/vnd.github+json" \
+              "$GITHUB_API_URL/repos/$RECORDS_REPO/contents/$1?ref=$RECORDS_BRANCH")
+            STATUS=${out##*$'\n'}; BODY=${out%$'\n'*}
+          }
+          # record <env> <name> → sets RECORD_TAG to the record's image.tag, or "" when there is none
+          record() {
+            api "lanes/$1/$2.yaml"
+            case "$STATUS" in
+              200) RECORD_TAG=$(printf '%s' "$BODY" | jq -r '.content' | base64 -d | yq -r '.image.tag // ""') ;;
+              404) RECORD_TAG="" ;;
+              *) die "Reading lanes/$1/$2.yaml from $RECORDS_REPO failed with HTTP $STATUS." "$BODY" ;;
+            esac
+          }
+
+          # ── The lane list ────────────────────────────────────────────────────
+          if [ -n "${LANES_OVERRIDE:-}" ]; then
+            lanes_yaml=$LANES_OVERRIDE
+            echo "::notice::Lane list taken from the 'lanes' input (dry run)."
+          else
+            [ -n "${DEPLOY_TOKEN:-}" ] || die "No App token and no 'lanes' input: the lane list cannot be read."
+            api "$LANES_PATH"
+            [ "$STATUS" = 200 ] || die "Reading $LANES_PATH from $RECORDS_REPO failed with HTTP $STATUS." \
+              "ravn-ops' main apply publishes that file (publish-lanes, ravn-ops#211). Until it has, there are no lanes to deploy to." "$BODY"
+            lanes_yaml=$(printf '%s' "$BODY" | jq -r '.content' | base64 -d)
+          fi
+          lanes=$(printf '%s' "$lanes_yaml" | yq -o=json -I=0 '.lanes') || die "lanes.yaml is not YAML with a 'lanes' list."
+          n=$(printf '%s' "$lanes" | jq 'if type=="array" then length else 0 end')
+          [ "$n" -gt 0 ] || die "lanes.yaml lists no lanes."
+          printf '%s' "$lanes" | jq -e 'all(.[]; (.env|type)=="string" and (.branch|type)=="string" and .env!="" and .branch!="")' >/dev/null \
+            || die "Every lane needs a non-empty 'env' and 'branch'." "$lanes"
+
+          k=$(printf '%s' "$lanes" | jq --arg b "$REF_NAME" 'map(.branch) | index($b) // -1')
+          [ "$k" -ge 0 ] || die "Branch '$REF_NAME' is not a lane." "Lanes: $(printf '%s' "$lanes" | jq -c 'map("\(.env)=\(.branch)")')"
+          env_name=$(printf '%s' "$lanes" | jq -r ".[$k].env")
+
+          # ── The images ───────────────────────────────────────────────────────
+          printf '%s' "$IMAGES" | jq -e 'type=="array" and length>0 and all(.[]; (.name|type)=="string" and (.name|test("^[a-z0-9][a-z0-9-]*$")))' >/dev/null \
+            || die "'images' must be a non-empty JSON array of {name, dockerfile?, target?, context?} with names like 'svc-greeter'." "$IMAGES"
+          names=$(printf '%s' "$IMAGES" | jq -r '.[].name')
+
+          # ── The decision ─────────────────────────────────────────────────────
+          short=${HEAD_SHA:0:7}
+          mode=build; from_env=""; from_sha=""; tag="sha-$short"
+          if [ "$k" -gt 0 ]; then
+            prev_env=$(printf '%s' "$lanes" | jq -r ".[$((k-1))].env")
+            prev_branch=$(printf '%s' "$lanes" | jq -r ".[$((k-1))].branch")
+            second=$(git rev-parse --verify -q "$HEAD_SHA^2" || true)
+            if [ -n "$second" ]; then
+              git rev-parse --verify -q "refs/remotes/origin/$prev_branch" >/dev/null \
+                || git fetch --no-tags origin "+refs/heads/$prev_branch:refs/remotes/origin/$prev_branch" \
+                || die "Lane $prev_env's branch '$prev_branch' does not exist in this repository, so nothing can be promoted from it."
+              if git merge-base --is-ancestor "$second" "refs/remotes/origin/$prev_branch"; then
+                mode=promote; from_env=$prev_env; from_sha=$second; tag="sha-${second:0:7}"
+              fi
+            fi
+            if [ "$mode" = promote ]; then
+              for name in $names; do
+                record "$prev_env" "$name"; have=$RECORD_TAG
+                [ -n "$have" ] || die "Lane $prev_env has no record for $name (lanes/$prev_env/$name.yaml)." \
+                  "Nothing has been deployed to $prev_env to promote. Deploy it there first."
+                [ "$have" = "$tag" ] || die "Lane $prev_env's record for $name is $have; this merge brought $tag." \
+                  "Either $prev_env has not finished deploying $tag (re-run this workflow when it has)," \
+                  "or $prev_env moved on since this merge was cut (merge $prev_branch into $REF_NAME again and let that run promote)." \
+                  "Nothing has been promoted."
+              done
+            else
+              mode=hotfix
+              echo "::warning title=HOTFIX BUILD on lane $env_name::HEAD $short is not a promotion from $prev_env ($prev_branch): it is built here and deployed straight to $env_name. Merge $REF_NAME back into $prev_branch now, or the next promotion will carry this change away."
+            fi
+          fi
+
+          {
+            echo "mode=$mode"; echo "env=$env_name"; echo "tag=$tag"
+            echo "from_env=$from_env"; echo "from_sha=$from_sha"
+            echo "build=$([ "$mode" = promote ] && echo false || echo true)"
+          } >> "$GITHUB_OUTPUT"
+          echo "Lane $k of $n: $env_name ($REF_NAME). Decision: $mode, tag $tag${from_env:+, promoted from $from_env @ $from_sha}."
+          # --- ravn:lane-decider:end ---
+
+      # ── Build (lane 0 and hotfixes) ────────────────────────────────────────
+      - name: Configure AWS credentials (OIDC)
+        if: steps.decide.outputs.build == 'true' && inputs.aws_account_id != ''
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # The services unit's convention: one CI role per repository.
+          role-to-assume: arn:aws:iam::${{ inputs.aws_account_id }}:role/ravn-github-ci-${{ github.event.repository.name }}
+          aws-region: ${{ inputs.aws_region }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        if: steps.decide.outputs.build == 'true' && inputs.aws_account_id != ''
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push
+        if: steps.decide.outputs.build == 'true'
+        env:
+          IMAGES: ${{ inputs.images }}
+          TAG: ${{ steps.decide.outputs.tag }}
+          REGISTRY: ${{ steps.ecr.outputs.registry || 'dry-run.invalid' }}
+          PUSH: ${{ inputs.dry_run == false }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$IMAGES" | jq -c '.[]' | while read -r image; do
+            name=$(jq -r '.name' <<<"$image")
+            dockerfile=$(jq -r '.dockerfile // "Dockerfile"' <<<"$image")
+            context=$(jq -r '.context // "."' <<<"$image")
+            target=$(jq -r '.target // ""' <<<"$image")
+            ref="$REGISTRY/$ECR_PREFIX/$name:$TAG"
+            # GIT_SHA → the image knows the revision it was built from (ADR
+            # platform-004). Dockerfiles that do not declare the ARG ignore it.
+            docker build -f "$dockerfile" ${target:+--target "$target"} \
+              --build-arg GIT_SHA="$GITHUB_SHA" -t "$ref" "$context"
+            if [ "$PUSH" = true ]; then
+              docker push "$ref"; echo "Pushed $ref"
+            else
+              echo "Dry run: built $ref, not pushed."
+            fi
+          done
+
+      # ── The record ─────────────────────────────────────────────────────────
+      - name: Write the lane record
+        id: record
+        env:
+          DEPLOY_TOKEN: ${{ steps.app.outputs.token }}
+          IMAGES: ${{ inputs.images }}
+          MODE: ${{ steps.decide.outputs.mode }}
+          LANE_ENV: ${{ steps.decide.outputs.env }}
+          TAG: ${{ steps.decide.outputs.tag }}
+          FROM_ENV: ${{ steps.decide.outputs.from_env }}
+          FROM_SHA: ${{ steps.decide.outputs.from_sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          # --- ravn:lane-recorder:begin ---
+          set -euo pipefail
+
+          die() { echo "::error::$1"; shift; [ "$#" -eq 0 ] || printf '%s\n' "$@"; exit 1; }
+          # api <method> <path> [json-body] → sets BODY and STATUS (not a
+          # subshell: a function run in $(…) cannot hand the status back)
+          api() {
+            local out query=""
+            [ "$1" = GET ] && query="?ref=$RECORDS_BRANCH"
+            if [ "$#" -ge 3 ]; then
+              out=$(curl -sS --max-time 30 -w '\n%{http_code}' -X "$1" \
+                -H "Authorization: Bearer $DEPLOY_TOKEN" -H "Accept: application/vnd.github+json" \
+                -H "Content-Type: application/json" --data-binary "$3" \
+                "$GITHUB_API_URL/repos/$RECORDS_REPO/contents/$2$query")
+            else
+              out=$(curl -sS --max-time 30 -w '\n%{http_code}' -X "$1" \
+                -H "Authorization: Bearer $DEPLOY_TOKEN" -H "Accept: application/vnd.github+json" \
+                "$GITHUB_API_URL/repos/$RECORDS_REPO/contents/$2$query")
+            fi
+            STATUS=${out##*$'\n'}; BODY=${out%$'\n'*}
+          }
+
+          # The commit that is being deployed: HEAD, or for a promotion the
+          # commit the previous lane ran.
+          source_sha=${FROM_SHA:-$HEAD_SHA}
+          case "$MODE" in
+            build)   suffix="" ;;
+            promote) suffix=" (promoted from $FROM_ENV @ $FROM_SHA)" ;;
+            hotfix)  suffix=" (hotfix)" ;;
+            *) die "Unknown mode '$MODE'." ;;
+          esac
+
+          summary() { printf '%s\n' "$@" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"; }
+          if [ "$MODE" = hotfix ]; then
+            summary "## ⚠️ HOTFIX build on lane \`$LANE_ENV\`" "" "\`$TAG\` was built from HEAD and deployed straight to \`$LANE_ENV\`. Merge this branch back into the previous lane's branch now." ""
+          else
+            summary "## Lane \`$LANE_ENV\`: $MODE \`$TAG\`${FROM_ENV:+ (promoted from \`$FROM_ENV\`)}" ""
+          fi
+
+          for name in $(printf '%s' "$IMAGES" | jq -r '.[].name'); do
+            path="lanes/$LANE_ENV/$name.yaml"
+            message="lane $LANE_ENV: $name $TAG$suffix $RUN_URL"
+            record=$(printf '# %s — written by the deploy workflow. Never hand-edited.\nimage:\n  tag: %s\n' "$path" "$TAG")
+
+            if [ "$DRY_RUN" = true ]; then
+              echo "Dry run: would write $path in $RECORDS_REPO:"; printf '%s\n' "$record" | sed 's/^/    /'
+              echo "  with the commit message: $message"
+              summary "**Dry run.** Would write \`$path\`:" '```yaml' "$record" '```' "with the message \`$message\`." ""
+              continue
+            fi
+
+            attempt=0
+            while :; do
+              attempt=$((attempt+1))
+              api GET "$path"; have_sha=""; have_tag=""
+              case "$STATUS" in
+                200) have_sha=$(printf '%s' "$BODY" | jq -r '.sha')
+                     have_tag=$(printf '%s' "$BODY" | jq -r '.content' | base64 -d | yq -r '.image.tag // ""') ;;
+                404) ;;
+                *) die "Reading $path from $RECORDS_REPO failed with HTTP $STATUS." "$BODY" ;;
+              esac
+
+              if [ "$have_tag" = "$TAG" ]; then
+                echo "$path already records $TAG; nothing to write."
+                summary "- \`$path\` already \`$TAG\`"
+                break
+              fi
+
+              # ❗The rollback guard. If the record names a commit that DESCENDS
+              # from the one being deployed, writing would roll the lane back:
+              # a re-run of an older run after a newer one, or a promotion cut
+              # before a hotfix was merged back. Refuse. Rolling back on purpose
+              # is a revert of the record commit in argo-apps.
+              if [ -n "$have_tag" ]; then
+                have_commit=$(git rev-parse --verify -q "${have_tag#sha-}^{commit}" || true)
+                if [ -n "$have_commit" ] && [ "$have_commit" != "$source_sha" ] \
+                   && ! git merge-base --is-ancestor "$have_commit" "$source_sha"; then
+                  die "Refusing to write $path: it records $have_tag, which is not an ancestor of $TAG in this repository." \
+                    "Writing $TAG would roll lane $LANE_ENV back to before $have_tag, or drop it." \
+                    "If this run is older than the one that wrote $have_tag, nothing is wrong: the newer deploy stands." \
+                    "If $have_tag is a hotfix, merge it back into the previous lane's branch and promote again." \
+                    "To roll back on purpose, revert the record commit in $RECORDS_REPO."
+                fi
+              fi
+
+              payload=$(jq -n --arg m "$message" --arg c "$(printf '%s\n' "$record" | base64 -w0)" --arg b "$RECORDS_BRANCH" --arg s "$have_sha" \
+                '{message: $m, content: $c, branch: $b} + (if $s != "" then {sha: $s} else {} end)')
+              api PUT "$path" "$payload"
+              case "$STATUS" in
+                200|201)
+                  commit=$(printf '%s' "$BODY" | jq -r '.commit.sha')
+                  echo "Wrote $path = $TAG in $RECORDS_REPO@$commit"
+                  summary "- \`$path\` ← \`$TAG\` ([$commit]($GITHUB_SERVER_URL/$RECORDS_REPO/commit/$commit))"
+                  break ;;
+                409|422)
+                  # Another deploy wrote the file between the GET and the PUT.
+                  [ "$attempt" -lt 4 ] || die "Writing $path failed with HTTP $STATUS after $attempt attempts." "$BODY"
+                  echo "HTTP $STATUS on $path (attempt $attempt): the record moved under us, re-reading."
+                  sleep "$attempt" ;;
+                *) die "Writing $path to $RECORDS_REPO failed with HTTP $STATUS." "$BODY" ;;
+              esac
+            done
+          done
+          # --- ravn:lane-recorder:end ---
