@@ -1,0 +1,60 @@
+# The deploy workflow's test caller: a DRY RUN of deploy.yml with one lane,
+# from this repository, on every change to it. It proves what a unit test
+# cannot — that the workflow_call contract parses, the inputs reach the steps,
+# the build step builds, and the record for `lanes/prod/<app>.yaml` is printed
+# with the right tag — without an App, an AWS role or a cluster.
+#
+# ❗A pull_request run is on a synthetic merge commit on ref `<n>/merge`, so the
+# scratch lane list names THAT ref as lane prod. The lane list is a dry-run
+# input; a real run reads argo-apps and refuses the input.
+#
+# The promote and hotfix branches of the logic need two lanes and the previous
+# lane's record; test/deploy.test.mjs drives those against scratch repositories
+# and a loopback Contents API.
+name: deploy-selftest
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/deploy.yml
+      - .github/workflows/deploy-selftest.yml
+      - test/deploy/**
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/deploy.yml
+      - .github/workflows/deploy-selftest.yml
+      - test/deploy/**
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  dry-run:
+    uses: ./.github/workflows/deploy.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      dry_run: true
+      images: '[{"name":"deploy-selftest","dockerfile":"test/deploy/Dockerfile"}]'
+      lanes: |
+        lanes:
+          - { env: prod, branch: "${{ github.ref_name }}" }
+
+  check:
+    needs: dry-run
+    runs-on: ubuntu-latest
+    env:
+      MODE: ${{ needs.dry-run.outputs.mode }}
+      LANE: ${{ needs.dry-run.outputs.env }}
+      TAG: ${{ needs.dry-run.outputs.tag }}
+    steps:
+      - name: With one lane, a push is a build of HEAD for prod
+        run: |
+          set -euo pipefail
+          want="sha-${GITHUB_SHA::7}"
+          echo "mode=$MODE lane=$LANE tag=$TAG (want build/prod/$want)"
+          [ "$MODE" = build ] && [ "$LANE" = prod ] && [ "$TAG" = "$want" ]
