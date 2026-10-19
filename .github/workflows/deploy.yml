@@ -23,6 +23,12 @@
 #   k ≥ 1, anything else
 #                    HOTFIX build: build HEAD, write lane k's record, and say so
 #                    loudly in the run.
+#   rollback_to set  ROLLBACK (argo-apps#12: a rollback is a deploy): no build.
+#                    Every image must already be in ECR at that tag, and the
+#                    commit must already be on lane k's branch. The record is
+#                    re-written to it over whatever it holds, as the App, and
+#                    the run says so loudly. Started by hand: a workflow_dispatch
+#                    of the caller's deploy.yml on the lane's branch.
 #
 # The record is `lanes/<env>/<name>.yaml` in argo-apps (`image: {tag: sha-<7>}`),
 # one commit per image through the Contents API with the `ravn-deploy` App, so
@@ -34,11 +40,12 @@
 # App credentials are the callers' org secrets, and the lane list is read at
 # run time.
 #
-# ❗The two bash blocks between the `ravn:lane-decider` and `ravn:lane-recorder`
-# markers are executed VERBATIM by test/deploy.test.mjs, against scratch git
-# repositories and a loopback GitHub API. The tested text and the shipped text
-# are the same text, so the promote and hotfix branches of the logic are
-# exercised on every PR without a lane, an App or a cluster.
+# ❗The three bash blocks between the `ravn:lane-decider`, `ravn:ecr-check` and
+# `ravn:lane-recorder` markers are executed VERBATIM by test/deploy.test.mjs,
+# against scratch git repositories, a loopback GitHub API and a stand-in `aws`.
+# The tested text and the shipped text are the same text, so the promote,
+# hotfix and rollback branches of the logic are exercised on every PR without a
+# lane, an App or a cluster.
 name: deploy
 
 on:
@@ -64,6 +71,17 @@ on:
       aws_region:
         type: string
         default: us-west-2
+      rollback_to:
+        description: >
+          Roll this lane back to an image an earlier run built: a `sha-<7>`
+          tag, or a full commit SHA. No build. Every image in `images` must
+          already be in ECR at that tag, and the commit must already be on
+          this lane's branch. The record is then re-written to it, over
+          whatever it holds, as `ravn-deploy[bot]`. A real rollback is a
+          `workflow_dispatch` of the caller's `deploy.yml` on the lane's
+          branch; any other event is refused. Works with `dry_run`.
+        type: string
+        default: ""
       dry_run:
         description: >
           Decide, build, and PRINT the record and commit message this run would
@@ -89,7 +107,7 @@ on:
         required: false
     outputs:
       mode:
-        description: What this run did — `build`, `promote` or `hotfix`.
+        description: What this run did — `build`, `promote`, `hotfix` or `rollback`.
         value: ${{ jobs.deploy.outputs.mode }}
       env:
         description: The lane deployed to, e.g. `prod`.
@@ -128,9 +146,15 @@ jobs:
         env:
           LANES_OVERRIDE: ${{ inputs.lanes }}
           AWS_ACCOUNT_ID: ${{ inputs.aws_account_id }}
+          ROLLBACK_TO: ${{ inputs.rollback_to }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           set -euo pipefail
           if [ "$DRY_RUN" != "true" ]; then
+            if [ -n "$ROLLBACK_TO" ] && [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+              echo "::error::'rollback_to' is set on a '$EVENT_NAME' run. A rollback is started by hand: a workflow_dispatch of the caller's deploy.yml on the lane's branch."
+              exit 1
+            fi
             if [ -n "$LANES_OVERRIDE" ]; then
               echo "::error::'lanes' is a dry-run input. A real run reads the lane list argo-apps holds."
               exit 1
@@ -165,12 +189,13 @@ jobs:
           owner: RavnSecurity
           repositories: argo-apps
 
-      - name: Decide — build, promote or hotfix
+      - name: Decide — build, promote, hotfix or rollback
         id: decide
         env:
           DEPLOY_TOKEN: ${{ steps.app.outputs.token }}
           LANES_OVERRIDE: ${{ inputs.lanes }}
           IMAGES: ${{ inputs.images }}
+          ROLLBACK_TO: ${{ inputs.rollback_to }}
           REF_NAME: ${{ github.ref_name }}
           HEAD_SHA: ${{ github.sha }}
         run: |
@@ -226,7 +251,28 @@ jobs:
           # ── The decision ─────────────────────────────────────────────────────
           short=${HEAD_SHA:0:7}
           mode=build; from_env=""; from_sha=""; tag="sha-$short"
-          if [ "$k" -gt 0 ]; then
+          if [ -n "${ROLLBACK_TO:-}" ]; then
+            # ❗A rollback re-records an image an earlier run built. HEAD is not
+            # read at all: no build, no promotion, no hotfix. The target has to
+            # be a commit this lane's branch already carried, or a rollback
+            # could deploy code that was never merged. Whether ECR holds the
+            # image is the next step's question.
+            want=${ROLLBACK_TO#sha-}
+            printf '%s' "$want" | grep -Eq '^[0-9a-f]{7,40}$' \
+              || die "'rollback_to' must be a sha-<7> image tag or a commit SHA; got '$ROLLBACK_TO'."
+            target=$(git rev-parse --verify -q "$want^{commit}") \
+              || die "'rollback_to' $ROLLBACK_TO is not a commit of this repository." \
+                "A rollback target is a sha-<7> tag an earlier run of this workflow built, from a commit on $REF_NAME."
+            git rev-parse --verify -q "refs/remotes/origin/$REF_NAME" >/dev/null \
+              || git fetch --no-tags origin "+refs/heads/$REF_NAME:refs/remotes/origin/$REF_NAME" \
+              || die "Lane $env_name's branch '$REF_NAME' cannot be fetched, so the rollback target cannot be checked against it." \
+                "A rollback runs on the lane's branch (workflow_dispatch with that branch selected), not on a tag or a pull request ref."
+            git merge-base --is-ancestor "$target" "refs/remotes/origin/$REF_NAME" \
+              || die "Refusing to roll back $env_name to ${target:0:7}: that commit was never on $REF_NAME." \
+                "A rollback re-records code that was merged to this lane. If it is a fix that has not landed yet, merge it and let the push deploy it."
+            mode=rollback; tag="sha-${target:0:7}"
+            echo "::notice title=ROLLBACK on lane $env_name::$tag will be re-recorded for $env_name with no build, once every image is found in ECR at that tag."
+          elif [ "$k" -gt 0 ]; then
             prev_env=$(printf '%s' "$lanes" | jq -r ".[$((k-1))].env")
             prev_branch=$(printf '%s' "$lanes" | jq -r ".[$((k-1))].branch")
             second=$(git rev-parse --verify -q "$HEAD_SHA^2" || true)
@@ -254,23 +300,63 @@ jobs:
             fi
           fi
 
+          case "$mode" in promote|rollback) build=false ;; *) build=true ;; esac
           {
             echo "mode=$mode"; echo "env=$env_name"; echo "tag=$tag"
             echo "from_env=$from_env"; echo "from_sha=$from_sha"
-            echo "build=$([ "$mode" = promote ] && echo false || echo true)"
+            echo "build=$build"
           } >> "$GITHUB_OUTPUT"
           echo "Lane $k of $n: $env_name ($REF_NAME). Decision: $mode, tag $tag${from_env:+, promoted from $from_env @ $from_sha}."
           # --- ravn:lane-decider:end ---
 
-      # ── Build (lane 0 and hotfixes) ────────────────────────────────────────
+      # ── AWS: builds push to ECR, rollbacks ask it ──────────────────────────
       - name: Configure AWS credentials (OIDC)
-        if: steps.decide.outputs.build == 'true' && inputs.aws_account_id != ''
+        if: (steps.decide.outputs.build == 'true' || steps.decide.outputs.mode == 'rollback') && inputs.aws_account_id != ''
         uses: aws-actions/configure-aws-credentials@v4
         with:
           # The services unit's convention: one CI role per repository.
           role-to-assume: arn:aws:iam::${{ inputs.aws_account_id }}:role/ravn-github-ci-${{ github.event.repository.name }}
           aws-region: ${{ inputs.aws_region }}
 
+      # ── Rollback: every image must already be there ────────────────────────
+      - name: Check the rollback target is in ECR
+        if: steps.decide.outputs.mode == 'rollback'
+        env:
+          IMAGES: ${{ inputs.images }}
+          TAG: ${{ steps.decide.outputs.tag }}
+          AWS_ACCOUNT_ID: ${{ inputs.aws_account_id }}
+        run: |
+          # --- ravn:ecr-check:begin ---
+          set -euo pipefail
+
+          die() { echo "::error::$1"; shift; [ "$#" -eq 0 ] || printf '%s\n' "$@"; exit 1; }
+
+          if [ -z "${AWS_ACCOUNT_ID:-}" ]; then
+            # Only a dry run gets here without an account: a real run was
+            # refused in the first step.
+            echo "::notice::Dry run with no aws_account_id: whether the images are in ECR at $TAG is not checked."
+            exit 0
+          fi
+
+          missing=""
+          for name in $(printf '%s' "$IMAGES" | jq -r '.[].name'); do
+            repo="$ECR_PREFIX/$name"
+            if pushed=$(aws ecr describe-images --registry-id "$AWS_ACCOUNT_ID" --repository-name "$repo" \
+                 --image-ids "imageTag=$TAG" --query 'imageDetails[0].imagePushedAt' --output text 2>&1); then
+              echo "$repo:$TAG is in ECR (pushed $pushed)."
+            elif printf '%s' "$pushed" | grep -q 'ImageNotFoundException\|RepositoryNotFoundException'; then
+              echo "$repo:$TAG is NOT in ECR."
+              missing="$missing $repo:$TAG"
+            else
+              die "Asking ECR about $repo:$TAG failed." "$pushed"
+            fi
+          done
+          [ -z "$missing" ] || die "Refusing to roll back: not in ECR:$missing." \
+            "A rollback re-records an image an earlier run built and pushed. Nothing has been written." \
+            "Either no run of this workflow built $TAG from this branch, or the image has since left ECR (a lifecycle policy?). Pick a tag a record in $RECORDS_REPO once held."
+          # --- ravn:ecr-check:end ---
+
+      # ── Build (lane 0 and hotfixes) ────────────────────────────────────────
       - name: Login to Amazon ECR
         id: ecr
         if: steps.decide.outputs.build == 'true' && inputs.aws_account_id != ''
@@ -314,6 +400,7 @@ jobs:
           FROM_ENV: ${{ steps.decide.outputs.from_env }}
           FROM_SHA: ${{ steps.decide.outputs.from_sha }}
           HEAD_SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
         run: |
           # --- ravn:lane-recorder:begin ---
           set -euo pipefail
@@ -341,18 +428,21 @@ jobs:
           # commit the previous lane ran.
           source_sha=${FROM_SHA:-$HEAD_SHA}
           case "$MODE" in
-            build)   suffix="" ;;
-            promote) suffix=" (promoted from $FROM_ENV @ $FROM_SHA)" ;;
-            hotfix)  suffix=" (hotfix)" ;;
+            build)    suffix="" ;;
+            promote)  suffix=" (promoted from $FROM_ENV @ $FROM_SHA)" ;;
+            hotfix)   suffix=" (hotfix)" ;;
+            rollback) suffix="" ;;  # set per record: it names the tag rolled back from
             *) die "Unknown mode '$MODE'." ;;
           esac
+          # rollback_suffix <old tag> → the suffix a rollback's commit message carries
+          rollback_suffix() { printf ' (rollback from %s, by %s)' "${1:-none}" "$ACTOR"; }
 
           summary() { printf '%s\n' "$@" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"; }
-          if [ "$MODE" = hotfix ]; then
-            summary "## ⚠️ HOTFIX build on lane \`$LANE_ENV\`" "" "\`$TAG\` was built from HEAD and deployed straight to \`$LANE_ENV\`. Merge this branch back into the previous lane's branch now." ""
-          else
-            summary "## Lane \`$LANE_ENV\`: $MODE \`$TAG\`${FROM_ENV:+ (promoted from \`$FROM_ENV\`)}" ""
-          fi
+          case "$MODE" in
+            hotfix)   summary "## ⚠️ HOTFIX build on lane \`$LANE_ENV\`" "" "\`$TAG\` was built from HEAD and deployed straight to \`$LANE_ENV\`. Merge this branch back into the previous lane's branch now." "" ;;
+            rollback) summary "## ⏪ ROLLBACK on lane \`$LANE_ENV\` to \`$TAG\`" "" "mode=rollback, by **$ACTOR**. No build: \`$TAG\` was already in ECR. Each record below is re-written over whatever it held (old → new), with the ancestor guard skipped on purpose." "" ;;
+            *)        summary "## Lane \`$LANE_ENV\`: $MODE \`$TAG\`${FROM_ENV:+ (promoted from \`$FROM_ENV\`)}" "" ;;
+          esac
 
           for name in $(printf '%s' "$IMAGES" | jq -r '.[].name'); do
             path="lanes/$LANE_ENV/$name.yaml"
@@ -360,6 +450,20 @@ jobs:
             record=$(printf '# %s — written by the deploy workflow. Never hand-edited.\nimage:\n  tag: %s\n' "$path" "$TAG")
 
             if [ "$DRY_RUN" = true ]; then
+              if [ "$MODE" = rollback ]; then
+                # Name what would be rolled back from, when the record can be read.
+                old="(not read: no App token)"
+                if [ -n "${DEPLOY_TOKEN:-}" ]; then
+                  api GET "$path"
+                  case "$STATUS" in
+                    200) old=$(printf '%s' "$BODY" | jq -r '.content' | base64 -d | yq -r '.image.tag // ""'); old=${old:-none} ;;
+                    404) old=none ;;
+                    *) die "Reading $path from $RECORDS_REPO failed with HTTP $STATUS." "$BODY" ;;
+                  esac
+                fi
+                message="lane $LANE_ENV: $name $TAG$(rollback_suffix "$old") $RUN_URL"
+                summary "- \`$path\`: \`$old\` → \`$TAG\` (dry run, not written)"
+              fi
               echo "Dry run: would write $path in $RECORDS_REPO:"; printf '%s\n' "$record" | sed 's/^/    /'
               echo "  with the commit message: $message"
               summary "**Dry run.** Would write \`$path\`:" '```yaml' "$record" '```' "with the message \`$message\`." ""
@@ -387,8 +491,11 @@ jobs:
               # from the one being deployed, writing would roll the lane back:
               # a re-run of an older run after a newer one, or a promotion cut
               # before a hotfix was merged back. Refuse. Rolling back on purpose
-              # is a revert of the record commit in argo-apps.
-              if [ -n "$have_tag" ]; then
+              # is a run with `rollback_to`, which is the one mode that skips
+              # this guard: overwriting a newer record is then the point.
+              if [ "$MODE" = rollback ]; then
+                message="lane $LANE_ENV: $name $TAG$(rollback_suffix "$have_tag") $RUN_URL"
+              elif [ -n "$have_tag" ]; then
                 have_commit=$(git rev-parse --verify -q "${have_tag#sha-}^{commit}" || true)
                 if [ -n "$have_commit" ] && [ "$have_commit" != "$source_sha" ] \
                    && ! git merge-base --is-ancestor "$have_commit" "$source_sha"; then
@@ -396,7 +503,7 @@ jobs:
                     "Writing $TAG would roll lane $LANE_ENV back to before $have_tag, or drop it." \
                     "If this run is older than the one that wrote $have_tag, nothing is wrong: the newer deploy stands." \
                     "If $have_tag is a hotfix, merge it back into the previous lane's branch and promote again." \
-                    "To roll back on purpose, revert the record commit in $RECORDS_REPO."
+                    "To roll back on purpose, run the caller's deploy.yml by hand (workflow_dispatch on this lane's branch) with rollback_to: $TAG."
                 fi
               fi
 
@@ -407,7 +514,12 @@ jobs:
                 200|201)
                   commit=$(printf '%s' "$BODY" | jq -r '.commit.sha')
                   echo "Wrote $path = $TAG in $RECORDS_REPO@$commit"
-                  summary "- \`$path\` ← \`$TAG\` ([$commit]($GITHUB_SERVER_URL/$RECORDS_REPO/commit/$commit))"
+                  if [ "$MODE" = rollback ]; then
+                    echo "::warning title=ROLLBACK on lane $LANE_ENV::$name: ${have_tag:-none} → $TAG, by $ACTOR. The record was re-written over a newer one on purpose ($RECORDS_REPO@$commit)."
+                    summary "- \`$path\`: \`${have_tag:-none}\` → \`$TAG\` ([$commit]($GITHUB_SERVER_URL/$RECORDS_REPO/commit/$commit))"
+                  else
+                    summary "- \`$path\` ← \`$TAG\` ([$commit]($GITHUB_SERVER_URL/$RECORDS_REPO/commit/$commit))"
+                  fi
                   break ;;
                 409|422)
                   # Another deploy wrote the file between the GET and the PUT.

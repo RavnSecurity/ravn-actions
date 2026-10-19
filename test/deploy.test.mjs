@@ -8,7 +8,9 @@
  * repositories are scratch git repositories with a real `origin`, and GitHub's
  * Contents API is a loopback server that remembers what was PUT. That is
  * enough to drive every row of ADR ops-007 §1's table — build, promote,
- * hotfix — and every refusal, without a lane, an App or a cluster.
+ * hotfix — and every refusal, without a lane, an App or a cluster. The
+ * rollback path (argo-apps#12: a rollback is a deploy) adds a third block, the
+ * ECR check, driven against a stand-in `aws` on PATH.
  */
 
 import assert from "node:assert/strict";
@@ -198,7 +200,7 @@ const outputs = (file) =>
 
 // ── The decider ──────────────────────────────────────────────────────────────
 
-async function decide({ clone, head, ref, lanes = "", api, token = api ? "app-token" : "", images = '[{"name":"svc-greeter"}]' }) {
+async function decide({ clone, head, ref, lanes = "", api, token = api ? "app-token" : "", images = '[{"name":"svc-greeter"}]', rollbackTo = "" }) {
   const outFile = join(scratch(), "github_output");
   writeFileSync(outFile, "");
   const r = await bash(block("lane-decider"), {
@@ -207,6 +209,7 @@ async function decide({ clone, head, ref, lanes = "", api, token = api ? "app-to
       DEPLOY_TOKEN: token,
       LANES_OVERRIDE: lanes,
       IMAGES: images,
+      ROLLBACK_TO: rollbackTo,
       REF_NAME: ref,
       HEAD_SHA: head,
       GITHUB_API_URL: api ? api.origin : "http://127.0.0.1:9",
@@ -363,13 +366,13 @@ test("when argo-apps does not hold the lane list yet, the run says who publishes
 
 // ── The recorder ─────────────────────────────────────────────────────────────
 
-async function writeRecord({ clone, api, mode, tag, head, fromEnv = "", fromSha = "", dryRun = false, images = '[{"name":"svc-greeter"}]' }) {
+async function writeRecord({ clone, api, mode, tag, head, fromEnv = "", fromSha = "", dryRun = false, images = '[{"name":"svc-greeter"}]', token = "app-token", actor = "dave" }) {
   const summary = join(scratch(), "summary.md");
   writeFileSync(summary, "");
   const r = await bash(block("lane-recorder"), {
     cwd: clone,
     env: {
-      DEPLOY_TOKEN: "app-token",
+      DEPLOY_TOKEN: token,
       IMAGES: images,
       MODE: mode,
       LANE_ENV: "prod",
@@ -377,6 +380,7 @@ async function writeRecord({ clone, api, mode, tag, head, fromEnv = "", fromSha 
       FROM_ENV: fromEnv,
       FROM_SHA: fromSha,
       HEAD_SHA: head,
+      ACTOR: actor,
       DRY_RUN: dryRun ? "true" : "false",
       RUN_URL,
       GITHUB_API_URL: api.origin,
@@ -463,7 +467,7 @@ test("❗the rollback guard: a record newer than the commit being deployed is ne
     assert.notEqual(r.code, 0);
     assert.equal(api.puts.length, 0, "nothing was written");
     assert.match(r.out, new RegExp(`::error::Refusing to write lanes/prod/svc-greeter.yaml: it records ${short(H)}`));
-    assert.match(r.out, /revert the record commit/);
+    assert.match(r.out, new RegExp(`To roll back on purpose, run the caller's deploy.yml by hand .* with rollback_to: ${short(A)}`));
   } finally {
     await api.close();
   }
@@ -563,9 +567,214 @@ test("any other HTTP failure stops the run with the status and the body", async 
   }
 });
 
+// ── Rollback (argo-apps#12: a rollback is a deploy) ──────────────────────────
+//
+// `rollback_to` re-records an image an earlier run built: the decider resolves
+// the target and checks it was on the lane's branch, the ECR check asks AWS
+// whether every image is there at that tag, and the recorder writes over
+// whatever the record holds, skipping the ancestor guard on purpose.
+
+test("rollback_to a sha-<7> on the lane's branch is mode rollback: no build, and HEAD is not read", async () => {
+  // HEAD F is a merge that would be a hotfix; none of that matters.
+  const { clone, A, F } = history();
+  const r = await decide({ clone, head: F, ref: "main", lanes: TWO_LANES, rollbackTo: short(A) });
+  assert.equal(r.code, 0, r.out);
+  assert.deepEqual(r.outputs, { mode: "rollback", env: "prod", tag: short(A), from_env: "", from_sha: "", build: "false" });
+  assert.match(r.out, /::notice title=ROLLBACK on lane prod::/);
+  assert.doesNotMatch(r.out, /HOTFIX/);
+  assert.match(r.out, /Decision: rollback/);
+});
+
+test("rollback_to a full commit SHA maps to its sha-<7> tag", async () => {
+  const { clone, A, F } = history();
+  const r = await decide({ clone, head: F, ref: "main", lanes: ONE_LANE, rollbackTo: A });
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.outputs.mode, "rollback");
+  assert.equal(r.outputs.tag, short(A));
+});
+
+test("a rollback target that was never on this lane's branch is refused", async () => {
+  // H is a hotfix on main. dev never carried it, so dev cannot be 'rolled back' to it.
+  const { clone, B, H } = history();
+  const r = await decide({ clone, head: B, ref: "dev", lanes: TWO_LANES, rollbackTo: short(H) });
+  assert.notEqual(r.code, 0);
+  assert.match(r.out, new RegExp(`::error::Refusing to roll back dev to ${H.slice(0, 7)}: that commit was never on dev\\.`));
+  assert.equal(r.outputs.mode, undefined, "no decision reaches the next step");
+});
+
+test("a rollback target this repository does not know, or that is not a sha at all, is refused", async () => {
+  const { clone, F } = history();
+  for (const [to, want] of [
+    ["sha-0000000", /::error::'rollback_to' sha-0000000 is not a commit of this repository\./],
+    ["v1.2.3", /::error::'rollback_to' must be a sha-<7> image tag or a commit SHA/],
+    ["sha-abc", /::error::'rollback_to' must be a sha-<7> image tag or a commit SHA/],
+  ]) {
+    const r = await decide({ clone, head: F, ref: "main", lanes: ONE_LANE, rollbackTo: to });
+    assert.notEqual(r.code, 0, to);
+    assert.match(r.out, want);
+  }
+});
+
+/**
+ * The ECR check, with a stand-in `aws` ahead of the real one on PATH: the
+ * images named in $FAKE_ECR (`ravn/<name>:<tag>`) exist; anything else gets
+ * the ImageNotFoundException the real CLI prints; `deny` gets an access error.
+ */
+async function ecrCheck({ tag, inEcr, images = '[{"name":"svc-greeter"}]', accountId = "123456789012", dryRun = false }) {
+  const bin = scratch();
+  writeFileSync(
+    join(bin, "aws"),
+    [
+      "#!/usr/bin/env bash",
+      "set -euo pipefail",
+      '[ "$1 $2" = "ecr describe-images" ] || { echo "unexpected aws call: $*" >&2; exit 2; }',
+      'repo=""; tag=""',
+      'while [ $# -gt 0 ]; do case "$1" in --repository-name) repo=$2; shift ;; --image-ids) tag=${2#imageTag=}; shift ;; esac; shift; done',
+      '[ "$FAKE_ECR" != deny ] || { echo "An error occurred (AccessDeniedException) when calling the DescribeImages operation: not allowed" >&2; exit 254; }',
+      'for have in $FAKE_ECR; do [ "$have" = "$repo:$tag" ] && { echo "2026-10-19T00:00:00+00:00"; exit 0; }; done',
+      "echo \"An error occurred (ImageNotFoundException) when calling the DescribeImages operation: The image with imageId {imageTag: '$tag'} does not exist within the repository with name '$repo' in the registry with id '123456789012'\" >&2",
+      "exit 254",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+  return bash(block("ecr-check"), {
+    cwd: scratch(),
+    env: {
+      PATH: `${bin}:${process.env.PATH}`,
+      FAKE_ECR: inEcr.join(" "),
+      IMAGES: images,
+      TAG: tag,
+      AWS_ACCOUNT_ID: accountId,
+      ECR_PREFIX: "ravn",
+      DRY_RUN: dryRun ? "true" : "false",
+      RECORDS_REPO,
+    },
+  });
+}
+
+test("a rollback asks ECR for every image at the tag, and goes on when all are there", async () => {
+  const r = await ecrCheck({ tag: "sha-abc1234", images: '[{"name":"system"},{"name":"portal"}]', inEcr: ["ravn/system:sha-abc1234", "ravn/portal:sha-abc1234"] });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /ravn\/system:sha-abc1234 is in ECR \(pushed 2026-10-19/);
+  assert.match(r.out, /ravn\/portal:sha-abc1234 is in ECR/);
+});
+
+test("❗a rollback to a tag any image is missing from ECR is refused, naming the missing ones", async () => {
+  const r = await ecrCheck({ tag: "sha-abc1234", images: '[{"name":"system"},{"name":"portal"}]', inEcr: ["ravn/system:sha-abc1234"] });
+  assert.notEqual(r.code, 0);
+  assert.match(r.out, /ravn\/portal:sha-abc1234 is NOT in ECR\./);
+  assert.match(r.out, /::error::Refusing to roll back: not in ECR: ravn\/portal:sha-abc1234\./);
+  assert.doesNotMatch(r.out, /not in ECR:.*ravn\/system/);
+  assert.match(r.out, /Nothing has been written/);
+});
+
+test("an ECR error that is not 'not found' stops the run with the error, not a false 'missing'", async () => {
+  const r = await ecrCheck({ tag: "sha-abc1234", inEcr: ["deny"] });
+  assert.notEqual(r.code, 0);
+  assert.match(r.out, /::error::Asking ECR about ravn\/svc-greeter:sha-abc1234 failed\./);
+  assert.match(r.out, /AccessDeniedException/);
+  assert.doesNotMatch(r.out, /Refusing to roll back/);
+});
+
+test("a dry run with no aws_account_id cannot ask ECR, and says so instead of guessing", async () => {
+  const r = await ecrCheck({ tag: "sha-abc1234", inEcr: [], accountId: "", dryRun: true });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /::notice::Dry run with no aws_account_id: whether the images are in ECR at sha-abc1234 is not checked\./);
+});
+
+test("❗a rollback writes over a NEWER record, skipping the guard, and says what it rolled back from and who did it", async () => {
+  // prod runs H. Rolling back to A, an ancestor of H, is exactly what the
+  // guard refuses for a build; a rollback does it on purpose.
+  const { clone, A, H } = history();
+  const api = await contentsApi({ files: { "lanes/prod/svc-greeter.yaml": record(short(H)) } });
+  try {
+    const r = await writeRecord({ clone, api, mode: "rollback", tag: short(A), head: H, actor: "dave" });
+    assert.equal(r.code, 0, r.out);
+    assert.equal(api.puts.length, 1);
+    assert.equal(api.puts[0].message, `lane prod: svc-greeter ${short(A)} (rollback from ${short(H)}, by dave) ${RUN_URL}`);
+    assert.ok(api.puts[0].sha, "an update carries the current blob sha");
+    assert.match(api.puts[0].decoded, new RegExp(`\nimage:\n  tag: ${short(A)}\n$`));
+    assert.match(r.out, new RegExp(`::warning title=ROLLBACK on lane prod::svc-greeter: ${short(H)} → ${short(A)}, by dave`));
+    assert.match(r.summary, /## ⏪ ROLLBACK on lane `prod` to `sha-[0-9a-f]{7}`/);
+    assert.match(r.summary, /mode=rollback, by \*\*dave\*\*/);
+    assert.match(r.summary, new RegExp("`" + short(H) + "` → `" + short(A) + "`"));
+  } finally {
+    await api.close();
+  }
+});
+
+test("❗the ordinary deploy after a rollback still writes: the rolled-back record is an ancestor of the new HEAD", async () => {
+  const { clone, A, H, F } = history();
+  const api = await contentsApi({ files: { "lanes/prod/svc-greeter.yaml": record(short(H)) } });
+  try {
+    const back = await writeRecord({ clone, api, mode: "rollback", tag: short(A), head: H });
+    assert.equal(back.code, 0, back.out);
+    assert.match(api.store.get("lanes/prod/svc-greeter.yaml").body, new RegExp(`tag: ${short(A)}`));
+    // The fix lands: a push to main builds F, which descends from A. The guard passes.
+    const next = await writeRecord({ clone, api, mode: "build", tag: short(F), head: F });
+    assert.equal(next.code, 0, next.out);
+    assert.equal(api.puts.length, 2);
+    assert.equal(api.puts[1].message, `lane prod: svc-greeter ${short(F)} ${RUN_URL}`);
+    assert.match(api.store.get("lanes/prod/svc-greeter.yaml").body, new RegExp(`tag: ${short(F)}`));
+    assert.doesNotMatch(next.out, /Refusing/);
+  } finally {
+    await api.close();
+  }
+});
+
+test("a rollback to what the record already holds is left alone", async () => {
+  const { clone, A } = history();
+  const api = await contentsApi({ files: { "lanes/prod/svc-greeter.yaml": record(short(A)) } });
+  try {
+    const r = await writeRecord({ clone, api, mode: "rollback", tag: short(A), head: A });
+    assert.equal(r.code, 0, r.out);
+    assert.equal(api.puts.length, 0);
+    assert.match(r.out, /already records/);
+    assert.doesNotMatch(r.out, /::warning/);
+  } finally {
+    await api.close();
+  }
+});
+
+test("a rollback dry run reads the record to name what it would roll back from, prints the record, and writes nothing", async () => {
+  const { clone, A, H } = history();
+  const api = await contentsApi({ files: { "lanes/prod/svc-greeter.yaml": record(short(H)) } });
+  try {
+    const r = await writeRecord({ clone, api, mode: "rollback", tag: short(A), head: H, dryRun: true, actor: "dave" });
+    assert.equal(r.code, 0, r.out);
+    assert.equal(api.puts.length, 0, "nothing was written");
+    assert.deepEqual(api.gets.map((g) => g.path), ["lanes/prod/svc-greeter.yaml"]);
+    assert.match(r.out, /Dry run: would write lanes\/prod\/svc-greeter.yaml in RavnSecurity\/argo-apps:/);
+    assert.match(r.out, new RegExp(`    image:\n      tag: ${short(A)}`));
+    assert.match(r.out, new RegExp(`with the commit message: lane prod: svc-greeter ${short(A)} \\(rollback from ${short(H)}, by dave\\) ${RUN_URL}`));
+    assert.doesNotMatch(r.out, /::warning/, "nothing happened, so nothing to warn about");
+    assert.match(r.summary, /## ⏪ ROLLBACK on lane `prod`/);
+    assert.match(r.summary, new RegExp("`" + short(H) + "` → `" + short(A) + "` \\(dry run, not written\\)"));
+  } finally {
+    await api.close();
+  }
+});
+
+test("a rollback dry run with no App token (a test caller) says the old tag was not read, and still prints the record", async () => {
+  const { clone, A, H } = history();
+  const api = await contentsApi({ files: { "lanes/prod/svc-greeter.yaml": record(short(H)) } });
+  try {
+    const r = await writeRecord({ clone, api, mode: "rollback", tag: short(A), head: H, dryRun: true, token: "" });
+    assert.equal(r.code, 0, r.out);
+    assert.equal(api.puts.length, 0);
+    assert.equal(api.gets.length, 0);
+    assert.match(r.out, new RegExp(`with the commit message: lane prod: svc-greeter ${short(A)} \\(rollback from \\(not read: no App token\\), by dave\\)`));
+  } finally {
+    await api.close();
+  }
+});
+
 test("the workflow holds contents: read and id-token: write, and nothing writes the caller's repo", () => {
   const text = readFileSync(WORKFLOW, "utf8");
   assert.doesNotMatch(text, /contents:\s*write/);
   assert.match(text, /permissions:\n\s+contents: read\n\s+id-token: write/);
   assert.doesNotMatch(text, /git push/);
+  assert.match(text, /rollback_to:\n\s+description:/, "the rollback_to input is declared");
+  assert.match(text, /if: steps\.decide\.outputs\.mode == 'rollback'\n/, "the ECR check runs for rollbacks only");
 });
