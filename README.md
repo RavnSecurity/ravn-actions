@@ -329,6 +329,7 @@ things:
 | **k = 0** | build `sha-<7>` from HEAD, push to ECR `ravn/<name>`, write lane 0's record |
 | **k ≥ 1, HEAD is a merge whose second parent is on lane k−1's branch** | **promote**: lane k−1's record must equal `HEAD^2`, then it is copied to lane k. No build |
 | **k ≥ 1, anything else** | **hotfix build**, said loudly in the run and the job summary |
+| **`rollback_to` set** (a `workflow_dispatch`) | **rollback**: no build; every image must already be in ECR at that tag and the commit on the lane's branch; the record is re-written over whatever it holds. See *Rolling back* |
 
 The record is `lanes/<env>/<name>.yaml` in argo-apps (`image: {tag: sha-<7>}`), written one
 commit per image through the Contents API as the `ravn-deploy` App, with the message
@@ -340,16 +341,50 @@ lane, every push to `main` is a build: today's behaviour minus the commit-back.
 the caller's repository. If that commit is not an ancestor of the one being deployed, the write
 is refused: that is a re-run of an older run after a newer one landed, or a promotion cut before
 a hotfix was merged back, and either would roll the lane back with a green build. Rolling back
-on purpose is a revert of the record commit in argo-apps.
+on purpose is a `rollback_to` run, below: the one mode that skips this guard.
+
+### Rolling back
+
+**A rollback is a deploy** (decided on
+[argo-apps#12](https://github.com/RavnSecurity/argo-apps/issues/12)). argo-apps' `validate`
+keeps refusing hand-made changes under `lanes/`, so a revert PR is not the way; instead the
+same workflow re-records an image an earlier run built, as `ravn-deploy[bot]`, and the run log
+plus the record commit are the audit trail. Start one by hand, on the lane's branch:
+
+```sh
+gh workflow run deploy.yml --repo RavnSecurity/<caller> --ref <lane branch> -f rollback_to=sha-<7>
+```
+
+That is a `workflow_dispatch` of the **caller's** `deploy.yml` with its `rollback_to` input
+set — a `sha-<7>` tag, or the full commit SHA — which the caller passes through to this
+workflow's `rollback_to`. The run then:
+
+- **Builds nothing.** Every image in `images` must already be in ECR at that tag
+  (`aws ecr describe-images`); if any is missing, the run refuses and writes nothing.
+- **Checks the target was merged to this lane:** the commit must be an ancestor of the lane's
+  branch. A rollback cannot deploy code that was never on the lane.
+- **Writes each record over whatever it holds**, skipping the guard above: overwriting a newer
+  record is the point. The commit message is
+  `lane <env>: <name> sha-<7> (rollback from sha-<old>, by <actor>) <run URL>`, and the job
+  summary and a `::warning title=ROLLBACK` annotation per record name the old and new tags and
+  who did it.
+- **Leaves the next ordinary deploy working.** The record then names an older commit, which is
+  an ancestor of the next HEAD, so the guard passes and the next push deploys as usual.
+
+A real rollback refuses to start from any event but `workflow_dispatch`. `dry_run: true` with
+`rollback_to` prints the records a rollback would write and writes nothing: with the App
+secrets it reads each record to name the tag it would roll back from, and with an
+`aws_account_id` it still asks ECR. `deploy-selftest.yml`'s `rollback-dry-run` job is that, for
+HEAD, on every push to `main` and on dispatch.
 
 **Dry runs.** `dry_run: true` decides, builds, and prints the record and commit message it would
 write; nothing is pushed and nothing is written. A test caller with no App installed passes the
 lane list as the `lanes` input (dry runs only; a real run refuses it) and no `aws_account_id`,
 and the build runs with no registry at all. `deploy-selftest.yml` is that caller, on every change
-to the workflow. The promote and hotfix branches need two lanes and the previous lane's record:
-`test/deploy.test.mjs` drives them by running the two marked bash blocks out of the workflow
-file against scratch git repositories and a loopback Contents API, so the tested text is the
-shipped text.
+to the workflow. The promote, hotfix and rollback branches need two lanes, the previous lane's
+record, or an ECR to ask: `test/deploy.test.mjs` drives them by running the three marked bash
+blocks out of the workflow file against scratch git repositories, a loopback Contents API and a
+stand-in `aws`, so the tested text is the shipped text.
 
 **Pinning.** Callers pin a tag: `deploy-v1` moves with compatible changes, `deploy-v1.<n>.<m>`
 does not. The tags are cut on `main` after merge. ❗Not `v1`: a bare major tag on this

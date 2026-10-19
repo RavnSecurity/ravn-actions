@@ -58,3 +58,41 @@ jobs:
           want="sha-${GITHUB_SHA::7}"
           echo "mode=$MODE lane=$LANE tag=$TAG (want build/prod/$want)"
           [ "$MODE" = build ] && [ "$LANE" = prod ] && [ "$TAG" = "$want" ]
+
+  # A rollback dry run (ravn-actions#22): HEAD re-recorded on the branch it is
+  # on, with no build. With no App token the record is printed with its old tag
+  # unread, and with no account ECR is not asked; what this proves is that
+  # `rollback_to` reaches the decider and comes back out as mode `rollback`.
+  #
+  # ❗Not on pull_request runs: there `github.ref_name` is `<n>/merge`, which is
+  # no branch, and a rollback asks whether the target is on origin/<ref_name>.
+  # It runs on a push to main and on workflow_dispatch; to run it on a branch,
+  # `gh workflow run deploy-selftest.yml --ref <branch>`.
+  rollback-dry-run:
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/deploy.yml
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      dry_run: true
+      rollback_to: ${{ github.sha }}
+      images: '[{"name":"deploy-selftest","dockerfile":"test/deploy/Dockerfile"}]'
+      lanes: |
+        lanes:
+          - { env: prod, branch: "${{ github.ref_name }}" }
+
+  check-rollback:
+    needs: rollback-dry-run
+    runs-on: ubuntu-latest
+    env:
+      MODE: ${{ needs.rollback-dry-run.outputs.mode }}
+      LANE: ${{ needs.rollback-dry-run.outputs.env }}
+      TAG: ${{ needs.rollback-dry-run.outputs.tag }}
+    steps:
+      - name: A rollback to HEAD is mode rollback, tagged sha-<HEAD>, on prod
+        run: |
+          set -euo pipefail
+          want="sha-${GITHUB_SHA::7}"
+          echo "mode=$MODE lane=$LANE tag=$TAG (want rollback/prod/$want)"
+          [ "$MODE" = rollback ] && [ "$LANE" = prod ] && [ "$TAG" = "$want" ]
